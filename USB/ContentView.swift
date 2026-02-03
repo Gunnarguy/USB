@@ -6,10 +6,13 @@
 //
 
 import Combine
+#if os(macOS)
 import IOKit
 import IOKit.usb
+#endif
 import SwiftUI
 
+#if os(macOS)
 // MARK: - IOKit USB Constants
 let kUSBVendorID = "idVendor"
 let kUSBProductID = "idProduct"
@@ -22,6 +25,7 @@ let kUSBDeviceSubClass = "bDeviceSubClass"
 let kUSBDeviceProtocol = "bDeviceProtocol"
 let kUSBMaxPower = "bMaxPower"
 let kUSBDevicePropertyLocationID = "locationID"
+#endif
 
 // MARK: - USB Device Class Descriptions (with layman explanations)
 let usbClassDescriptions: [Int: (name: String, description: String, icon: String, layman: String)] = [
@@ -49,6 +53,7 @@ let usbClassDescriptions: [Int: (name: String, description: String, icon: String
     255: ("Custom Device", "Manufacturer-specific", "shippingbox", "Uses the manufacturer's own special features")
 ]
 
+#if os(macOS)
 // MARK: - USB Controller Model
 struct USBController: Identifiable, Hashable {
     let id = UUID()
@@ -715,8 +720,10 @@ class USBManager: ObservableObject {
         )
     }
 }
+#endif
 
 // MARK: - View Mode
+#if os(macOS)
 enum ViewMode: String, CaseIterable {
     case devices = "Devices"
     case controllers = "Controllers"
@@ -732,8 +739,10 @@ enum ViewMode: String, CaseIterable {
         }
     }
 }
+#endif
 
 // MARK: - Content View
+#if os(macOS)
 struct ContentView: View {
     @StateObject private var usbManager = USBManager()
     @State private var selectedDevice: USBDevice?
@@ -1947,6 +1956,157 @@ struct RoundedCorner: Shape {
         return path
     }
 }
+
+#endif // os(macOS)
+
+// MARK: - iOS Content View
+#if os(iOS)
+struct ContentView: View {
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 24) {
+                    // Hero Section
+                    VStack(spacing: 16) {
+                        ZStack {
+                            Circle()
+                                .fill(LinearGradient(colors: [.blue.opacity(0.3), .purple.opacity(0.3)], startPoint: .topLeading, endPoint: .bottomTrailing))
+                                .frame(width: 120, height: 120)
+                            Image(systemName: "cable.connector")
+                                .font(.system(size: 50))
+                                .foregroundStyle(.blue)
+                        }
+
+                        Text("USB Inspector")
+                            .font(.largeTitle)
+                            .fontWeight(.bold)
+
+                        Text("Advanced USB Device Analysis")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.top, 40)
+
+                    // Platform Notice
+                    VStack(spacing: 16) {
+                        Image(systemName: "desktopcomputer")
+                            .font(.system(size: 40))
+                            .foregroundStyle(.orange)
+
+                        Text("Mac Required for USB Inspection")
+                            .font(.headline)
+
+                        Text("USB device inspection requires low-level hardware access that is only available on macOS. iPadOS does not provide the necessary system APIs to enumerate and inspect USB devices.")
+                            .font(.body)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal)
+                    }
+                    .padding(24)
+                    .background(Color.orange.opacity(0.1))
+                    .cornerRadius(16)
+                    .padding(.horizontal)
+
+                    // Features Section
+                    VStack(alignment: .leading, spacing: 16) {
+                        Text("Features on Mac")
+                            .font(.headline)
+                            .padding(.horizontal)
+
+                        FeatureRow(icon: "cable.connector", color: .blue, title: "USB Device Detection", description: "Automatically detect all connected USB devices")
+                        FeatureRow(icon: "bolt.fill", color: .green, title: "Speed Analysis", description: "See connection speeds from USB 1.0 to USB 3.2")
+                        FeatureRow(icon: "battery.100.bolt", color: .yellow, title: "Power Monitoring", description: "Monitor power draw and availability")
+                        FeatureRow(icon: "cpu", color: .purple, title: "Controller Info", description: "View USB controller details and capabilities")
+                        FeatureRow(icon: "bolt.horizontal.fill", color: .indigo, title: "Thunderbolt Support", description: "Inspect Thunderbolt ports and devices")
+                    }
+                    .padding(.vertical)
+
+                    // USB Info Section
+                    VStack(alignment: .leading, spacing: 16) {
+                        Text("USB Speed Reference")
+                            .font(.headline)
+                            .padding(.horizontal)
+
+                        USBSpeedInfoRow(version: "USB 1.0/1.1", speed: "1.5 - 12 Mbps", color: .orange, description: "Low/Full Speed")
+                        USBSpeedInfoRow(version: "USB 2.0", speed: "480 Mbps", color: .yellow, description: "High Speed")
+                        USBSpeedInfoRow(version: "USB 3.0", speed: "5 Gbps", color: .green, description: "SuperSpeed")
+                        USBSpeedInfoRow(version: "USB 3.1/3.2", speed: "10-20 Gbps", color: .blue, description: "SuperSpeed+")
+                        USBSpeedInfoRow(version: "USB4", speed: "40-80 Gbps", color: .purple, description: "Based on Thunderbolt")
+                    }
+                    .padding(.vertical)
+
+                    Spacer(minLength: 50)
+                }
+            }
+            .navigationTitle("USB Inspector")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+}
+
+struct FeatureRow: View {
+    let icon: String
+    let color: Color
+    let title: String
+    let description: String
+
+    var body: some View {
+        HStack(spacing: 16) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(color.opacity(0.2))
+                    .frame(width: 44, height: 44)
+                Image(systemName: icon)
+                    .font(.title2)
+                    .foregroundStyle(color)
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+                Text(description)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+        }
+        .padding(.horizontal)
+    }
+}
+
+struct USBSpeedInfoRow: View {
+    let version: String
+    let speed: String
+    let color: Color
+    let description: String
+
+    var body: some View {
+        HStack {
+            Circle()
+                .fill(color)
+                .frame(width: 12, height: 12)
+
+            Text(version)
+                .font(.subheadline)
+                .fontWeight(.medium)
+                .frame(width: 100, alignment: .leading)
+
+            Text(speed)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            Spacer()
+
+            Text(description)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal)
+    }
+}
+#endif
 
 #Preview {
     ContentView()
