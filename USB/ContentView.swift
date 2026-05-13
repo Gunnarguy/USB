@@ -7,7 +7,10 @@
 
 import Combine
 #if os(macOS)
+import AppKit
+import DiskArbitration
 import IOKit
+import IOKit.storage
 import IOKit.usb
 #endif
 import SwiftUI
@@ -54,9 +57,1091 @@ let usbClassDescriptions: [Int: (name: String, description: String, icon: String
 ]
 
 #if os(macOS)
+struct USBVendorProfile {
+    let canonicalName: String
+    let companySummary: String
+    let usbContext: String
+}
+
+struct USBDescriptorMeaning: Hashable {
+    let technicalLabel: String
+    let plainEnglish: String
+    let macBehavior: String
+    let uniqueness: String
+    let tags: [String]
+}
+
+struct USBProductCatalogEntry {
+    let vendorIDs: Set<Int>
+    let vendorTokens: [String]
+    let productTokens: [String]
+    let category: String
+    let summary: String
+    let highlights: [String]
+    let badges: [String]
+}
+
+struct StorageVolumeInfo: Identifiable, Hashable {
+    let bsdName: String
+    let wholeDiskBSDName: String
+    let volumeName: String
+    let mediaName: String
+    let fileSystem: String
+    let mountPath: String
+    let capacityBytes: Int64
+    let availableBytes: Int64
+    let isWholeDisk: Bool
+    let isMounted: Bool
+    let isLeaf: Bool
+    let deviceModel: String
+    let deviceProtocol: String
+    let volumeUUID: String
+    let mediaUUID: String
+
+    var id: String { bsdName }
+
+    var displayName: String {
+        if !volumeName.isEmpty { return volumeName }
+        if !mediaName.isEmpty { return mediaName }
+        return bsdName
+    }
+
+    var roleDescription: String {
+        if isWholeDisk { return "Physical disk" }
+        if isMounted { return "Mounted volume" }
+        if !fileSystem.isEmpty { return "Partition / container" }
+        return "Disk component"
+    }
+
+    var mountDescription: String {
+        isMounted ? mountPath : "Not mounted in Finder"
+    }
+
+    var capacityDescription: String {
+        formatByteCount(capacityBytes)
+    }
+
+    var availableDescription: String {
+        availableBytes > 0 ? formatByteCount(availableBytes) : "Unknown"
+    }
+
+    var subtitle: String {
+        var parts: [String] = [roleDescription]
+        if !fileSystem.isEmpty { parts.append(fileSystem) }
+        if capacityBytes > 0 { parts.append(capacityDescription) }
+        return orderedUniqueStrings(parts).joined(separator: " • ")
+    }
+}
+
+private func normalizedLookupToken(_ value: String) -> String {
+    value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        .lowercased()
+}
+
+private func stringContainsAny(_ value: String, fragments: [String]) -> Bool {
+    let normalizedValue = normalizedLookupToken(value)
+    return fragments.contains { normalizedValue.contains(normalizedLookupToken($0)) }
+}
+
+private func orderedUniqueStrings(_ values: [String]) -> [String] {
+    var seen: Set<String> = []
+    var result: [String] = []
+
+    for value in values {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { continue }
+        if seen.insert(trimmed).inserted {
+            result.append(trimmed)
+        }
+    }
+
+    return result
+}
+
+private func naturalLanguageList(_ values: [String]) -> String {
+    let uniqueValues = orderedUniqueStrings(values)
+
+    switch uniqueValues.count {
+    case 0:
+        return ""
+    case 1:
+        return uniqueValues[0]
+    case 2:
+        return "\(uniqueValues[0]) and \(uniqueValues[1])"
+    default:
+        return uniqueValues.dropLast().joined(separator: ", ") + ", and " + (uniqueValues.last ?? "")
+    }
+}
+
+private func hexByte(_ value: Int) -> String {
+    String(format: "%02Xh", value & 0xFF)
+}
+
+private func formatByteCount(_ value: Int64) -> String {
+    guard value > 0 else { return "Unknown" }
+    let formatter = ByteCountFormatter()
+    formatter.allowedUnits = [.useBytes, .useKB, .useMB, .useGB, .useTB]
+    formatter.countStyle = .file
+    formatter.includesUnit = true
+    formatter.isAdaptive = true
+    return formatter.string(fromByteCount: value)
+}
+
+private func stableUSBDeviceID(vendorID: Int, productID: Int, serialNumber: String, sessionID: UInt64, locationID: UInt32, name: String) -> String {
+    if !serialNumber.isEmpty {
+        return "usb-\(vendorID)-\(productID)-\(serialNumber)"
+    }
+    if sessionID > 0 {
+        return "usb-session-\(sessionID)"
+    }
+    return "usb-\(locationID)-\(vendorID)-\(productID)-\(name)"
+}
+
+private func registryEntryName(_ service: io_registry_entry_t) -> String {
+    var nameBuffer = [CChar](repeating: 0, count: 256)
+    guard IORegistryEntryGetName(service, &nameBuffer) == KERN_SUCCESS else { return "" }
+    return String(cString: nameBuffer)
+}
+
+private func matchesCatalogEntry(_ entry: USBProductCatalogEntry, vendorID: Int, vendorName: String, productName: String) -> Bool {
+    let normalizedVendorName = normalizedLookupToken(vendorName)
+    let normalizedProductName = normalizedLookupToken(productName)
+
+    let vendorMatches = entry.vendorIDs.isEmpty
+        || entry.vendorIDs.contains(vendorID)
+        || entry.vendorTokens.contains(where: { normalizedVendorName.contains(normalizedLookupToken($0)) })
+
+    let productMatches = entry.productTokens.isEmpty
+        || entry.productTokens.contains(where: { normalizedProductName.contains(normalizedLookupToken($0)) })
+
+    return vendorMatches && productMatches
+}
+
+private let usbProductCatalog: [USBProductCatalogEntry] = [
+    USBProductCatalogEntry(
+        vendorIDs: [0x04E8],
+        vendorTokens: ["samsung"],
+        productTokens: ["pssd t5", "pssd t7", "pssd t9", "portable ssd"],
+        category: "Samsung portable SSD",
+        summary: "This looks like a Samsung portable SSD rather than a generic removable disk. These drives usually expose standard USB storage transports and rely on the enclosure bridge for their USB personality.",
+        highlights: [
+            "Portable SSDs are a good case where the USB transport matters more than the marketing name on the shell.",
+            "If this falls back to BOT or negotiates below 10 Gbps, the bridge, cable, hub, or host path is the first thing to question."
+        ],
+        badges: ["SSD", "Portable"]
+    ),
+    USBProductCatalogEntry(
+        vendorIDs: [0x152D],
+        vendorTokens: ["jmicron"],
+        productTokens: ["jms583", "jms580", "jms578", "jms567", "jms56"],
+        category: "USB storage bridge",
+        summary: "This is likely a JMicron bridge chip sitting between USB and SATA/NVMe media. The bridge is what macOS sees first, which is why the device identity can differ from the actual drive installed inside the enclosure.",
+        highlights: [
+            "Bridge chips are normal in external SSD enclosures and card readers.",
+            "The bridge determines whether you get UAS, BOT, TRIM behavior, and sometimes thermal quirks."
+        ],
+        badges: ["Bridge", "JMicron"]
+    ),
+    USBProductCatalogEntry(
+        vendorIDs: [0x174C],
+        vendorTokens: ["asmedia"],
+        productTokens: ["asm2362", "asm235cm", "asm1153", "asm1051", "asm235"],
+        category: "USB storage bridge",
+        summary: "This is likely an ASMedia bridge controller. On external enclosures and docks, ASMedia frequently represents the USB-facing bridge silicon rather than the retail product brand.",
+        highlights: [
+            "ASMedia bridges are common in NVMe/SATA enclosures and multiport docks.",
+            "Bridge silicon often explains odd speed ceilings better than the SSD vendor name does."
+        ],
+        badges: ["Bridge", "ASMedia"]
+    ),
+    USBProductCatalogEntry(
+        vendorIDs: [0x0BDA],
+        vendorTokens: ["realtek"],
+        productTokens: ["rtl8153", "rtl8156", "2.5gbe", "gigabit ethernet", "usb 10/100/1000"],
+        category: "USB Ethernet adapter",
+        summary: "This looks like a Realtek USB Ethernet controller. On docks and dongles, Realtek is usually the networking chip the host talks to directly.",
+        highlights: [
+            "The controller silicon is often more informative than the retail dock brand for troubleshooting link speed and driver behavior.",
+            "2.5 GbE adapters commonly revolve around RTL8156-family parts."
+        ],
+        badges: ["Ethernet", "Realtek"]
+    ),
+    USBProductCatalogEntry(
+        vendorIDs: [],
+        vendorTokens: ["asix"],
+        productTokens: ["ax88179", "ax88772"],
+        category: "USB Ethernet adapter",
+        summary: "This looks like an ASIX USB networking controller, which is a common chipset family in USB Ethernet dongles.",
+        highlights: [
+            "ASIX controllers are a strong clue that the device is a network bridge rather than a storage or HID accessory."
+        ],
+        badges: ["Ethernet", "ASIX"]
+    ),
+    USBProductCatalogEntry(
+        vendorIDs: [0x046D],
+        vendorTokens: ["logitech"],
+        productTokens: ["unifying receiver", "bolt receiver"],
+        category: "Wireless input receiver",
+        summary: "This looks like a Logitech wireless receiver that can represent several keyboards, mice, or other input devices behind one tiny USB endpoint.",
+        highlights: [
+            "The single USB device can be the parent for multiple wireless peripherals that never show up as separate USB cables."
+        ],
+        badges: ["Receiver", "Input"]
+    ),
+    USBProductCatalogEntry(
+        vendorIDs: [0x0403],
+        vendorTokens: ["ftdi"],
+        productTokens: ["ft232", "ft231", "ft2232", "usb serial"],
+        category: "USB serial bridge",
+        summary: "This looks like an FTDI USB-to-serial bridge, which usually means the USB layer is just carrying a UART-style control or console channel for embedded hardware.",
+        highlights: [
+            "Serial bridges are common in dev boards, lab gear, CNC equipment, and firmware consoles."
+        ],
+        badges: ["Serial", "FTDI"]
+    ),
+    USBProductCatalogEntry(
+        vendorIDs: [0x10C4],
+        vendorTokens: ["silicon labs"],
+        productTokens: ["cp210", "cp2102", "cp2104", "cp2105"],
+        category: "USB serial bridge",
+        summary: "This looks like a Silicon Labs CP210x-style USB serial bridge, which is commonly used to expose debug or control channels from embedded devices.",
+        highlights: [
+            "If you were expecting a disk or camera, a CP210x identity means the device is really offering a serial-style control path."
+        ],
+        badges: ["Serial", "CP210x"]
+    ),
+    USBProductCatalogEntry(
+        vendorIDs: [0x1A86],
+        vendorTokens: ["wch"],
+        productTokens: ["ch340", "ch341", "ch9102"],
+        category: "USB serial bridge",
+        summary: "This looks like a WCH serial bridge, the kind of low-cost USB transport often used by hobbyist boards and embedded adapters.",
+        highlights: [
+            "These chips are common in maker hardware because they cheaply turn USB into a UART console."
+        ],
+        badges: ["Serial", "WCH"]
+    ),
+    USBProductCatalogEntry(
+        vendorIDs: [],
+        vendorTokens: [],
+        productTokens: ["card reader", "sd reader", "cfexpress", "micro sd"],
+        category: "Card reader",
+        summary: "This looks like a card reader. The USB endpoint is stable, but the actual storage media behind it can change completely depending on what card is inserted.",
+        highlights: [
+            "Card readers often present as plain mass storage even though the removable media behind them is interchangeable."
+        ],
+        badges: ["Media", "Reader"]
+    ),
+    USBProductCatalogEntry(
+        vendorIDs: [],
+        vendorTokens: [],
+        productTokens: ["dock", "docking station", "multiport", "usb-c hub", "travel dock"],
+        category: "Dock / hub",
+        summary: "This looks like a dock or hub-class product. These often collapse several very different functions into one upstream USB-C or USB link.",
+        highlights: [
+            "Docks frequently contain storage bridges, Ethernet chips, audio controllers, billboard devices, and multiple downstream hub stages."
+        ],
+        badges: ["Dock", "Multi-function"]
+    ),
+    USBProductCatalogEntry(
+        vendorIDs: [],
+        vendorTokens: [],
+        productTokens: ["cam link", "capture", "video capture"],
+        category: "Video capture device",
+        summary: "This looks like a capture-oriented device. These usually expose video-control and video-streaming interfaces instead of acting like storage.",
+        highlights: [
+            "Capture devices often negotiate bandwidth-heavy alternate settings on the streaming side."
+        ],
+        badges: ["Capture", "Video"]
+    ),
+    USBProductCatalogEntry(
+        vendorIDs: [],
+        vendorTokens: [],
+        productTokens: ["dfu", "fastboot", "recovery"],
+        category: "Firmware / recovery interface",
+        summary: "This looks like a firmware, bootloader, or recovery-mode interface rather than the device's normal runtime personality.",
+        highlights: [
+            "Recovery-oriented identities are usually temporary and disappear once the device boots normally."
+        ],
+        badges: ["Recovery", "Firmware"]
+    )
+]
+
+private func lookupProductCatalogEntry(vendorID: Int, vendorName: String, productName: String) -> USBProductCatalogEntry? {
+    usbProductCatalog.first { entry in
+        matchesCatalogEntry(entry, vendorID: vendorID, vendorName: vendorName, productName: productName)
+    }
+}
+
+private func lookupVendorProfile(vendorID: Int, vendorName: String) -> USBVendorProfile? {
+    switch vendorID {
+    case 0x04E8:
+        return USBVendorProfile(
+            canonicalName: "Samsung",
+            companySummary: "Samsung commonly shows up in USB land as portable SSDs, flash storage, phones, tablets, and recovery interfaces.",
+            usbContext: "When the product string looks like PSSD or T-series storage, it is usually a standard bus-powered external SSD rather than a custom-protocol device."
+        )
+    case 0x05AC:
+        return USBVendorProfile(
+            canonicalName: "Apple",
+            companySummary: "Apple uses USB for both external accessories and a surprising amount of internal hardware such as cameras, Bluetooth bridges, and recovery paths.",
+            usbContext: "On a Mac, Apple-branded USB devices are often built-in infrastructure rather than removable peripherals."
+        )
+    case 0x046D:
+        return USBVendorProfile(
+            canonicalName: "Logitech",
+            companySummary: "Logitech mostly appears here as input devices, receivers, webcams, conference gear, and USB audio endpoints.",
+            usbContext: "If the product string mentions a receiver, Bolt, or Unifying, it is usually multiplexing several input devices over one radio link."
+        )
+    case 0x0781:
+        return USBVendorProfile(
+            canonicalName: "SanDisk",
+            companySummary: "SanDisk is primarily associated with flash media, thumb drives, SSDs, and memory-card products.",
+            usbContext: "Most SanDisk USB devices speak standard mass-storage protocols, so macOS should treat them like disks instead of needing a vendor app."
+        )
+    case 0x1058:
+        return USBVendorProfile(
+            canonicalName: "Western Digital",
+            companySummary: "Western Digital commonly shows up as external HDDs, SSDs, and bridge-based storage enclosures.",
+            usbContext: "With storage hardware, the USB view often reflects the bridge/controller inside the enclosure more than the marketing name on the outside."
+        )
+    case 0x0BC2:
+        return USBVendorProfile(
+            canonicalName: "Seagate",
+            companySummary: "Seagate is mostly associated with external hard drives, backup drives, and storage appliances.",
+            usbContext: "These devices usually surface as standard mass storage and should be understood mainly through the storage transport they negotiated."
+        )
+    case 0x0951:
+        return USBVendorProfile(
+            canonicalName: "Kingston",
+            companySummary: "Kingston commonly appears as flash drives, card readers, and SSD-related USB storage devices.",
+            usbContext: "Most Kingston devices are straightforward storage endpoints with standard descriptors."
+        )
+    case 0x0BDA:
+        return USBVendorProfile(
+            canonicalName: "Realtek",
+            companySummary: "Realtek is usually the chip vendor behind USB Ethernet adapters, card readers, audio codecs, and combo wireless bridges.",
+            usbContext: "If you bought a dock or adapter from another brand, a Realtek vendor ID often means you are seeing the controller silicon rather than the retail brand."
+        )
+    case 0x174C:
+        return USBVendorProfile(
+            canonicalName: "ASMedia",
+            companySummary: "ASMedia commonly appears as the bridge/controller silicon inside USB storage enclosures, hubs, and docks.",
+            usbContext: "An ASMedia vendor ID often identifies the USB bridge chip rather than the SSD or enclosure brand on the box."
+        )
+    case 0x152D:
+        return USBVendorProfile(
+            canonicalName: "JMicron",
+            companySummary: "JMicron frequently shows up as the USB-to-SATA/NVMe bridge inside external storage enclosures and card readers.",
+            usbContext: "Seeing JMicron usually means this is a bridge board translating USB into another storage bus behind the scenes."
+        )
+    case 0x8087:
+        return USBVendorProfile(
+            canonicalName: "Intel",
+            companySummary: "Intel vendor IDs often appear on wireless/Bluetooth combo controllers, internal bridges, or platform-management hardware.",
+            usbContext: "On Macs and PCs alike, an Intel USB endpoint is often internal infrastructure rather than a removable gadget."
+        )
+    case 0x0A5C:
+        return USBVendorProfile(
+            canonicalName: "Broadcom",
+            companySummary: "Broadcom commonly appears as Bluetooth, Wi-Fi, or internal bridge silicon inside laptops and accessories.",
+            usbContext: "If the device is internal and wireless-related, Broadcom is often the radio/controller rather than a user-facing peripheral."
+        )
+    case 0x045E:
+        return USBVendorProfile(
+            canonicalName: "Microsoft",
+            companySummary: "Microsoft commonly shows up as keyboards, mice, controllers, webcams, and docking accessories.",
+            usbContext: "These devices usually speak standard HID, audio, or video classes rather than exotic vendor-specific protocols."
+        )
+    case 0x18D1:
+        return USBVendorProfile(
+            canonicalName: "Google",
+            companySummary: "Google vendor IDs often appear on Android phones, developer devices, and recovery/fastboot interfaces.",
+            usbContext: "When the class looks vendor-specific or application-specific, the device may be in a debug, sideload, or firmware-update mode."
+        )
+    case 0x054C:
+        return USBVendorProfile(
+            canonicalName: "Sony",
+            companySummary: "Sony commonly appears as cameras, controllers, phones, and media devices.",
+            usbContext: "Depending on the class, Sony hardware may present as imaging, HID, storage, or a vendor-specific service interface."
+        )
+    case 0x04A9:
+        return USBVendorProfile(
+            canonicalName: "Canon",
+            companySummary: "Canon most often appears as cameras, printers, scanners, and imaging gear.",
+            usbContext: "Imaging devices sometimes expose multiple interfaces for control, still capture, and streaming/video paths."
+        )
+    case 0x0403:
+        return USBVendorProfile(
+            canonicalName: "FTDI",
+            companySummary: "FTDI is best known for USB-to-serial bridges used in embedded development, lab hardware, and debugging tools.",
+            usbContext: "If you see FTDI, the USB link is often just a transport wrapper around a serial console or control channel."
+        )
+    case 0x10C4:
+        return USBVendorProfile(
+            canonicalName: "Silicon Labs",
+            companySummary: "Silicon Labs commonly appears as USB-to-UART bridges, radios, and embedded-device support interfaces.",
+            usbContext: "This usually means the device is exposing a control/debug path rather than a consumer-friendly USB class."
+        )
+    case 0x1A86:
+        return USBVendorProfile(
+            canonicalName: "WCH",
+            companySummary: "WCH is commonly seen on low-cost USB-to-serial bridges such as CH340-family chips used in hobbyist hardware.",
+            usbContext: "These are often tiny bridge chips that make microcontrollers and dev boards look like serial devices over USB."
+        )
+    default:
+        break
+    }
+
+    let normalizedVendorName = normalizedLookupToken(vendorName)
+
+    if normalizedVendorName.contains("samsung") {
+        return USBVendorProfile(
+            canonicalName: "Samsung",
+            companySummary: "Samsung commonly shows up in USB land as portable SSDs, flash storage, phones, tablets, and recovery interfaces.",
+            usbContext: "When the product string looks like PSSD or T-series storage, it is usually a standard bus-powered external SSD rather than a custom-protocol device."
+        )
+    }
+
+    if normalizedVendorName.contains("realtek") {
+        return USBVendorProfile(
+            canonicalName: "Realtek",
+            companySummary: "Realtek is usually the chip vendor behind USB Ethernet adapters, card readers, audio codecs, and combo wireless bridges.",
+            usbContext: "If you bought a dock or adapter from another brand, a Realtek vendor ID often means you are seeing the controller silicon rather than the retail brand."
+        )
+    }
+
+    if normalizedVendorName.contains("asmedia") {
+        return USBVendorProfile(
+            canonicalName: "ASMedia",
+            companySummary: "ASMedia commonly appears as the bridge/controller silicon inside USB storage enclosures, hubs, and docks.",
+            usbContext: "An ASMedia vendor ID often identifies the USB bridge chip rather than the SSD or enclosure brand on the box."
+        )
+    }
+
+    return nil
+}
+
+private func descriptorMeaningFor(classCode: Int, subClass: Int, protocolCode: Int, isDeviceLevel: Bool) -> USBDescriptorMeaning {
+    switch classCode {
+    case -1:
+        return USBDescriptorMeaning(
+            technicalLabel: "Unclassified USB device",
+            plainEnglish: "macOS did not expose enough descriptor detail to give this device a confident class-level identity.",
+            macBehavior: "The raw registry data is still useful, but the top-level role has to be inferred from names, drivers, and surrounding context.",
+            uniqueness: "This usually happens with incomplete descriptors, unusual bridges, or vendor-specific hardware.",
+            tags: ["unknown"]
+        )
+    case 0x00:
+        return USBDescriptorMeaning(
+            technicalLabel: "Composite / interface-defined device",
+            plainEnglish: "The device descriptor intentionally leaves the real job description to its individual interfaces.",
+            macBehavior: "macOS will inspect each interface separately and can attach different drivers to different functions on the same physical device.",
+            uniqueness: "This is normal for docks, webcams with microphones, printers/scanners, and other multi-function USB hardware.",
+            tags: ["composite"]
+        )
+    case 0x01:
+        let technicalLabel: String
+        let plainEnglish: String
+        let uniqueness: String
+
+        switch subClass {
+        case 0x01:
+            technicalLabel = "Audio Control Interface"
+            plainEnglish = "This is the control side of a USB audio device, where it advertises mixers, clocking, input/output topology, and routing."
+            uniqueness = "Audio devices often pair this with one or more streaming interfaces that carry the actual sound data."
+        case 0x02:
+            technicalLabel = "Audio Streaming Interface"
+            plainEnglish = "This interface carries the actual audio stream for speakers, microphones, headsets, or audio interfaces."
+            uniqueness = "Alternate settings often change bandwidth, channel count, or sample-rate capability."
+        case 0x03:
+            technicalLabel = "MIDI Streaming Interface"
+            plainEnglish = "This interface carries MIDI note/control events rather than raw PCM audio."
+            uniqueness = "A MIDI streaming interface is about musical control messages, not speaker or microphone audio data."
+        default:
+            technicalLabel = "USB Audio Interface"
+            plainEnglish = "This is part of a USB audio device and is likely involved in sound routing or streaming."
+            uniqueness = "USB audio devices often split control and streaming into separate interfaces."
+        }
+
+        return USBDescriptorMeaning(
+            technicalLabel: technicalLabel,
+            plainEnglish: plainEnglish,
+            macBehavior: "macOS will typically expose this through Sound settings, Core Audio apps, conferencing apps, or DAWs.",
+            uniqueness: uniqueness,
+            tags: ["audio"] + (subClass == 0x03 ? ["midi"] : [])
+        )
+    case 0x02:
+        return USBDescriptorMeaning(
+            technicalLabel: "Communication / CDC Control Interface",
+            plainEnglish: "This is the control plane for a communication-oriented USB function such as networking, tethering, modem behavior, or management.",
+            macBehavior: "macOS may pair this with a CDC data interface and surface it as a network adapter, tethering path, or control channel.",
+            uniqueness: "CDC devices often split control and data across separate interfaces, so the real payload may live elsewhere in the interface list.",
+            tags: ["network", "communication"]
+        )
+    case 0x03:
+        let technicalLabel: String
+        let plainEnglish: String
+        let uniqueness: String
+        var tags = ["hid", "input"]
+
+        switch (subClass, protocolCode) {
+        case (0x01, 0x01):
+            technicalLabel = "Boot Keyboard Interface"
+            plainEnglish = "This is the keyboard-compatible HID path that can work even before full OS-level drivers are involved."
+            uniqueness = "The boot protocol is a stripped-down keyboard mode designed for maximum compatibility."
+            tags.append("keyboard")
+        case (0x01, 0x02):
+            technicalLabel = "Boot Mouse Interface"
+            plainEnglish = "This is the mouse-compatible HID path for pointer movement and buttons."
+            uniqueness = "The boot protocol is the simplest pointer mode and is meant to work in firmware and recovery environments too."
+            tags.append("mouse")
+        default:
+            technicalLabel = "Generic HID Interface"
+            plainEnglish = "This interface carries human-input-style events such as keys, buttons, pointing data, pen input, or controller actions."
+            uniqueness = "HID is the standard class for keyboards, mice, tablets, game controllers, and many small control surfaces."
+        }
+
+        return USBDescriptorMeaning(
+            technicalLabel: technicalLabel,
+            plainEnglish: plainEnglish,
+            macBehavior: "macOS routes this through the HID stack, so it behaves like input hardware instead of mounting like a disk.",
+            uniqueness: uniqueness,
+            tags: tags
+        )
+    case 0x05:
+        return USBDescriptorMeaning(
+            technicalLabel: "Physical / Haptics Interface",
+            plainEnglish: "This interface is for physical-feedback or haptics-oriented behavior rather than generic file or network traffic.",
+            macBehavior: "You usually see this behind specialized controllers or force-feedback accessories rather than as a standalone endpoint in Finder.",
+            uniqueness: "It is rare in everyday peripherals compared with HID, audio, or mass storage.",
+            tags: ["haptics"]
+        )
+    case 0x06:
+        return USBDescriptorMeaning(
+            technicalLabel: "Still Imaging Interface",
+            plainEnglish: "This is an imaging-oriented interface used by cameras, scanners, or photo-import devices."
+                ,
+            macBehavior: "macOS may surface it to image-capture workflows, camera utilities, or photo import tools rather than as a mounted disk.",
+            uniqueness: "Imaging devices may expose both storage-like and camera-control interfaces on the same hardware.",
+            tags: ["imaging", "camera"]
+        )
+    case 0x07:
+        return USBDescriptorMeaning(
+            technicalLabel: "Printer Interface",
+            plainEnglish: "This interface is meant for print jobs and printer status/control traffic.",
+            macBehavior: "macOS may expose it through the printing stack rather than through Finder or Disk Utility.",
+            uniqueness: "Printers often show up as multi-function composite devices when scanning or faxing features are present too.",
+            tags: ["printer"]
+        )
+    case 0x08:
+        let commandSet: String
+        switch subClass {
+        case 0x01: commandSet = "RBC"
+        case 0x02: commandSet = "MMC/ATAPI"
+        case 0x03: commandSet = "QIC"
+        case 0x04: commandSet = "UFI"
+        case 0x05: commandSet = "SFF-8070i"
+        case 0x06: commandSet = "SCSI Transparent"
+        default: commandSet = "class-defined"
+        }
+
+        let technicalLabel: String
+        let uniqueness: String
+        var tags = ["storage"]
+
+        switch protocolCode {
+        case 0x50:
+            technicalLabel = "Bulk-Only Mass Storage"
+            uniqueness = "BOT is the older compatibility storage transport; it works well, but fast SSDs usually perform better over UAS."
+            tags.append("bot")
+        case 0x62:
+            technicalLabel = "UAS Mass Storage"
+            uniqueness = "UAS supports command queuing and lower overhead than BOT, which is why it is a good sign for modern SSD performance."
+            tags.append("uas")
+        default:
+            technicalLabel = "Mass Storage Interface"
+            uniqueness = "\(commandSet) describes the command set, while the protocol byte explains how those storage commands move over USB."
+        }
+
+        return USBDescriptorMeaning(
+            technicalLabel: technicalLabel,
+            plainEnglish: "This is the storage transport macOS uses for disks, flash media, card readers, and external storage enclosures.",
+            macBehavior: "Finder, Disk Utility, backup tools, and file-copy operations talk through this interface when the device is acting like a disk.",
+            uniqueness: uniqueness,
+            tags: tags
+        )
+    case 0x09:
+        let technicalLabel: String
+        let uniqueness: String
+
+        switch protocolCode {
+        case 0x00:
+            technicalLabel = isDeviceLevel ? "Full-Speed USB Hub" : "Hub Interface"
+            uniqueness = "This is the classic hub path for older low/full-speed downstream devices."
+        case 0x01:
+            technicalLabel = isDeviceLevel ? "High-Speed Hub (single TT)" : "Hub Interface"
+            uniqueness = "Single-TT hubs share one transaction translator for USB 2.0-era traffic, which can become a bottleneck with several slower devices attached."
+        case 0x02:
+            technicalLabel = isDeviceLevel ? "High-Speed Hub (multi TT)" : "Hub Interface"
+            uniqueness = "Multi-TT hubs isolate low/full-speed traffic better than single-TT hubs, which can help mixed-device performance."
+        default:
+            technicalLabel = "USB Hub"
+            uniqueness = "Hub descriptors matter because every downstream device inherits this upstream path's limits."
+        }
+
+        return USBDescriptorMeaning(
+            technicalLabel: technicalLabel,
+            plainEnglish: "This device fans one upstream USB connection out into multiple downstream ports.",
+            macBehavior: "Anything plugged into the hub depends on this path for bandwidth, latency, and power budget.",
+            uniqueness: uniqueness,
+            tags: ["hub"]
+        )
+    case 0x0A:
+        return USBDescriptorMeaning(
+            technicalLabel: "CDC Data Interface",
+            plainEnglish: "This is the data plane for a communications or networking USB function.",
+            macBehavior: "macOS may pair it with a CDC control interface to create tethering, serial-over-USB, or network-style behavior.",
+            uniqueness: "On composite devices, this often looks boring by itself because the control interface is what explains the higher-level role."
+            ,
+            tags: ["network", "communication"]
+        )
+    case 0x0B:
+        return USBDescriptorMeaning(
+            technicalLabel: "Smart Card Interface",
+            plainEnglish: "This interface is for chip cards, security tokens, or authentication readers.",
+            macBehavior: "macOS may route it into security middleware or token software rather than treating it like generic storage.",
+            uniqueness: "Smart-card devices often matter more for identity/auth workflows than for bulk data transfer.",
+            tags: ["security"]
+        )
+    case 0x0E:
+        let technicalLabel: String
+        let plainEnglish: String
+        let uniqueness: String
+
+        switch subClass {
+        case 0x01:
+            technicalLabel = "Video Control Interface"
+            plainEnglish = "This is the control side of a webcam or capture device, where formats, camera controls, and streaming setup are described."
+            uniqueness = "Video devices usually expose a separate streaming interface that actually carries the pixels."
+        case 0x02:
+            technicalLabel = "Video Streaming Interface"
+            plainEnglish = "This interface carries the live video stream for a webcam, camera, or capture device."
+            uniqueness = "Alternate settings often control how much USB bandwidth the video stream is allowed to consume."
+        default:
+            technicalLabel = "USB Video Interface"
+            plainEnglish = "This is part of a video-oriented USB device such as a webcam or capture path."
+            uniqueness = "Video gear often splits control and streaming across separate interfaces."
+        }
+
+        return USBDescriptorMeaning(
+            technicalLabel: technicalLabel,
+            plainEnglish: plainEnglish,
+            macBehavior: "macOS will typically surface this to camera, conferencing, or capture apps rather than to Finder.",
+            uniqueness: uniqueness,
+            tags: ["video", "camera"]
+        )
+    case 0x0F:
+        return USBDescriptorMeaning(
+            technicalLabel: "Personal Healthcare Interface",
+            plainEnglish: "This interface is intended for healthcare or biometric-style device traffic.",
+            macBehavior: "Whether it is usable on macOS depends heavily on the vendor software and the exact device class implementation.",
+            uniqueness: "Healthcare-class USB gear often carries specialized, standards-based data rather than everyday consumer traffic."
+            ,
+            tags: ["health"]
+        )
+    case 0x10:
+        return USBDescriptorMeaning(
+            technicalLabel: "Audio/Video Interface",
+            plainEnglish: "This interface is part of a device that combines audio and video behavior under the USB AV class model.",
+            macBehavior: "macOS will usually treat it like conferencing, capture, or media-routing hardware rather than like storage.",
+            uniqueness: "It is effectively a media-oriented composite role even if the device does not present as a classic composite class at the top level."
+            ,
+            tags: ["audio", "video"]
+        )
+    case 0x11:
+        return USBDescriptorMeaning(
+            technicalLabel: "USB-C Billboard Device",
+            plainEnglish: "A billboard device mostly exists to report USB-C capability or alternate-mode failure/status rather than to move everyday user data.",
+            macBehavior: "You often see this on docks, adapters, and displays that want to tell the host something about DisplayPort Alt Mode or USB-C negotiation.",
+            uniqueness: "Billboard devices are gold for troubleshooting odd USB-C behavior because they can surface why a mode did not come up."
+            ,
+            tags: ["usb-c", "billboard"]
+        )
+    case 0x12:
+        return USBDescriptorMeaning(
+            technicalLabel: "USB Type-C Bridge Interface",
+            plainEnglish: "This is a bridge/control path used by USB-C or alternate-mode infrastructure inside a dock, retimer, or adapter.",
+            macBehavior: "macOS usually treats this as plumbing rather than as something you interact with directly.",
+            uniqueness: "You care about it when you are debugging docks, muxes, cable behavior, or Type-C mode switching."
+            ,
+            tags: ["usb-c", "bridge"]
+        )
+    case 0xDC:
+        return USBDescriptorMeaning(
+            technicalLabel: "Diagnostic / Debug Interface",
+            plainEnglish: "This interface exists for tracing, debug, compliance, or design-for-test workflows rather than for normal end-user features.",
+            macBehavior: "Unless you are using a development or validation toolchain, macOS may simply expose the raw endpoint without a friendly consumer role.",
+            uniqueness: "These interfaces are intentionally technical and are often only meaningful to firmware, silicon, or manufacturing tools."
+            ,
+            tags: ["diagnostic"]
+        )
+    case 0xE0:
+        let technicalLabel: String
+        let plainEnglish: String
+        let uniqueness: String
+        var tags = ["wireless"]
+
+        switch (subClass, protocolCode) {
+        case (0x01, 0x01):
+            technicalLabel = "Bluetooth Controller Interface"
+            plainEnglish = "This is the USB transport path for a Bluetooth radio/controller."
+            uniqueness = "Bluetooth-over-USB often appears on internal combo radios and some external dongles."
+            tags.append("bluetooth")
+        default:
+            technicalLabel = "Wireless Controller Interface"
+            plainEnglish = "This is a wireless-control interface rather than a generic storage or input endpoint."
+            uniqueness = "Wireless controller classes are infrastructure-oriented and often back another user-facing feature such as Bluetooth or tethering."
+        }
+
+        return USBDescriptorMeaning(
+            technicalLabel: technicalLabel,
+            plainEnglish: plainEnglish,
+            macBehavior: "macOS will route this into the wireless stack rather than exposing it as a file-oriented device.",
+            uniqueness: uniqueness,
+            tags: tags
+        )
+    case 0xEF:
+        return USBDescriptorMeaning(
+            technicalLabel: "Miscellaneous USB Interface",
+            plainEnglish: "This class bucket is used for a grab bag of standards that do not fit the older core USB classes cleanly.",
+            macBehavior: "The exact behavior depends heavily on the subclass/protocol pair and can range from tethering to interface association metadata.",
+            uniqueness: "When a device lands here, the subclass/protocol bytes usually matter more than the base class name itself.",
+            tags: ["misc"]
+        )
+    case 0xFE:
+        if subClass == 0x01 && protocolCode == 0x01 {
+            return USBDescriptorMeaning(
+                technicalLabel: "Device Firmware Update (DFU)",
+                plainEnglish: "This interface exists for firmware flashing, recovery, or low-level maintenance rather than for the device's normal runtime job.",
+                macBehavior: "You usually see DFU only during update, restore, or rescue workflows.",
+                uniqueness: "It is common on dev boards, instruments, and embedded products that need field-updatable firmware.",
+                tags: ["firmware", "recovery"]
+            )
+        }
+
+        return USBDescriptorMeaning(
+            technicalLabel: "Application-Specific Interface",
+            plainEnglish: "This interface follows an application-focused USB spec rather than the classic consumer classes like storage or HID.",
+            macBehavior: "macOS may need an app, framework, or domain-specific driver to make real use of it.",
+            uniqueness: "Application-specific interfaces are common in lab gear, firmware tools, and specialist hardware."
+            ,
+            tags: ["application-specific"]
+        )
+    case 0xFF:
+        return USBDescriptorMeaning(
+            technicalLabel: "Vendor-Specific Interface",
+            plainEnglish: "The vendor is using a private protocol instead of a standard USB class definition.",
+            macBehavior: "macOS can see the endpoint, but meaningful behavior often depends on vendor software, a DriverKit extension, or a custom utility.",
+            uniqueness: "This is where the raw IDs, names, and driver owner matter most because the class bytes intentionally stop helping."
+            ,
+            tags: ["vendor-specific"]
+        )
+    default:
+        return USBDescriptorMeaning(
+            technicalLabel: "USB Class \(hexByte(classCode))",
+            plainEnglish: "This is a less common USB class that the app does not have a richer local translation for yet.",
+            macBehavior: "The raw class, subclass, and protocol bytes are still shown so you can reason about it precisely.",
+            uniqueness: "Rare USB classes often make sense only in the context of a particular industry spec or vendor product line.",
+            tags: ["other"]
+        )
+    }
+}
+
+private func productCategoryHint(vendorID: Int, vendorName: String, productName: String, meaning: USBDescriptorMeaning, isHub: Bool) -> String? {
+    if stringContainsAny(productName, fragments: ["portable ssd", "pssd", "ssd", "nvme"]) {
+        return stringContainsAny(productName, fragments: ["nvme"]) ? "External NVMe / SSD storage" : "Portable SSD"
+    }
+
+    if stringContainsAny(productName, fragments: ["hard drive", "desktop drive", "portable drive", "hdd", "disk"]) {
+        return "External hard drive"
+    }
+
+    if stringContainsAny(productName, fragments: ["card reader", "sd reader", "micro sd", "cfexpress", "compactflash"]) {
+        return "Card reader"
+    }
+
+    if stringContainsAny(productName, fragments: ["dock", "docking"]) {
+        return "USB dock"
+    }
+
+    if isHub || stringContainsAny(productName, fragments: ["hub"]) {
+        return "USB hub"
+    }
+
+    if stringContainsAny(productName, fragments: ["ethernet", "lan", "gigabit", "2.5gbe", "5gbe", "10gbe"]) {
+        return "USB network adapter"
+    }
+
+    if stringContainsAny(productName, fragments: ["keyboard"]) {
+        return "Keyboard"
+    }
+
+    if stringContainsAny(productName, fragments: ["mouse", "trackpad", "trackball"]) {
+        return "Mouse / pointing device"
+    }
+
+    if stringContainsAny(productName, fragments: ["receiver", "unifying", "bolt receiver", "dongle"]) && meaning.tags.contains(where: { ["hid", "input"].contains($0) }) {
+        return "Input receiver"
+    }
+
+    if stringContainsAny(productName, fragments: ["camera", "webcam", "capture", "cam", "facetime"]) {
+        return "Camera / capture device"
+    }
+
+    if stringContainsAny(productName, fragments: ["mic", "microphone", "headset", "speaker", "dac", "audio"]) {
+        return "Audio device"
+    }
+
+    if stringContainsAny(productName, fragments: ["bluetooth", "bt"]) {
+        return "Bluetooth adapter"
+    }
+
+    if stringContainsAny(productName, fragments: ["phone", "iphone", "ipad", "pixel", "android"]) {
+        return "Phone / tablet connection"
+    }
+
+    if meaning.tags.contains("storage") { return "Storage device" }
+    if meaning.tags.contains("hub") { return "USB hub" }
+    if meaning.tags.contains("video") { return "Video device" }
+    if meaning.tags.contains("audio") { return "Audio device" }
+    if meaning.tags.contains("network") { return "Network adapter" }
+    if meaning.tags.contains("bluetooth") { return "Bluetooth adapter" }
+    if meaning.tags.contains(where: { ["hid", "input"].contains($0) }) { return "Input device" }
+    if meaning.tags.contains("usb-c") || meaning.tags.contains("billboard") { return "USB-C infrastructure device" }
+    if meaning.tags.contains("firmware") { return "Firmware / recovery interface" }
+    if meaning.tags.contains("vendor-specific") { return "Vendor-specific accessory" }
+
+    let normalizedVendorName = normalizedLookupToken(vendorName)
+    if vendorID == 0x04E8 || normalizedVendorName.contains("samsung") {
+        if stringContainsAny(productName, fragments: ["t5", "t7", "t9"]) {
+            return "Samsung portable SSD"
+        }
+    }
+
+    return nil
+}
+
+private func specificProductHint(vendorID: Int, vendorName: String, productName: String) -> String? {
+    let normalizedVendorName = normalizedLookupToken(vendorName)
+
+    if (vendorID == 0x04E8 || normalizedVendorName.contains("samsung")) && stringContainsAny(productName, fragments: ["pssd", "t5", "t7", "t9"]) {
+        return "Samsung's T-series portable SSDs normally expose standard USB mass-storage interfaces, so the protocol choice here tells you more than any Samsung-specific driver would."
+    }
+
+    if stringContainsAny(productName, fragments: ["unifying", "bolt receiver"]) {
+        return "This looks like a small receiver that can multiplex several wireless input devices behind one USB plug."
+    }
+
+    if stringContainsAny(productName, fragments: ["card reader"]) {
+        return "Card readers often look like generic mass storage even though the removable media behind them can change completely from one moment to the next."
+    }
+
+    if stringContainsAny(productName, fragments: ["dock", "hub"]) {
+        return "Docks and hubs often bundle networking, storage bridges, video plumbing, and USB-C control paths into one composite shell."
+    }
+
+    if stringContainsAny(productName, fragments: ["facetime"]) {
+        return "This is likely an internal Apple camera path rather than a removable webcam."
+    }
+
+    return nil
+}
+
+private func interfaceOwnerExplanation(_ owner: String) -> String? {
+    let normalizedOwner = normalizedLookupToken(owner)
+    guard !normalizedOwner.isEmpty else { return nil }
+
+    if normalizedOwner.contains("massstorage") {
+        return "macOS handed this interface to its mass-storage stack, so this is the path your file system and Disk Utility depend on."
+    }
+
+    if normalizedOwner.contains("audio") {
+        return "macOS attached its audio stack here, so this interface is participating in sound input/output rather than general data transfer."
+    }
+
+    if normalizedOwner.contains("bluetooth") {
+        return "macOS attached its Bluetooth stack here, which means this interface is acting as radio transport rather than a user-facing USB endpoint."
+    }
+
+    if normalizedOwner.contains("hid") {
+        return "macOS attached the HID stack here, so the interface is being treated as input hardware."
+    }
+
+    if normalizedOwner.contains("cdc") || normalizedOwner.contains("network") {
+        return "macOS is treating this interface as communication/network plumbing instead of a normal file or input device."
+    }
+
+    return "macOS currently shows this interface as owned by \(owner)."
+}
+
+private func intValue(_ value: Any?) -> Int? {
+    if let int = value as? Int { return int }
+    if let number = value as? NSNumber { return number.intValue }
+    if let string = value as? String { return Int(string) }
+    return nil
+}
+
+private func uint32Value(_ value: Any?) -> UInt32? {
+    if let number = value as? NSNumber { return number.uint32Value }
+    if let int = value as? Int { return UInt32(int) }
+    if let string = value as? String, let int = UInt32(string) { return int }
+    return nil
+}
+
+private func uint64Value(_ value: Any?) -> UInt64? {
+    if let number = value as? NSNumber { return number.uint64Value }
+    if let int = value as? Int { return UInt64(int) }
+    if let string = value as? String, let int = UInt64(string) { return int }
+    return nil
+}
+
+private func boolValue(_ value: Any?) -> Bool? {
+    if let bool = value as? Bool { return bool }
+    if let number = value as? NSNumber { return number.boolValue }
+    if let string = value as? String { return NSString(string: string).boolValue }
+    return nil
+}
+
+private func stringValue(_ value: Any?) -> String? {
+    if let string = value as? String { return string }
+    if let number = value as? NSNumber { return number.stringValue }
+    return nil
+}
+
+private func firstInt(in properties: [String: Any], keys: [String]) -> Int? {
+    for key in keys {
+        if let value = intValue(properties[key]) { return value }
+    }
+    return nil
+}
+
+private func firstUInt32(in properties: [String: Any], keys: [String]) -> UInt32? {
+    for key in keys {
+        if let value = uint32Value(properties[key]) { return value }
+    }
+    return nil
+}
+
+private func firstUInt64(in properties: [String: Any], keys: [String]) -> UInt64? {
+    for key in keys {
+        if let value = uint64Value(properties[key]) { return value }
+    }
+    return nil
+}
+
+private func firstBool(in properties: [String: Any], keys: [String]) -> Bool? {
+    for key in keys {
+        if let value = boolValue(properties[key]) { return value }
+    }
+    return nil
+}
+
+private func firstString(in properties: [String: Any], keys: [String]) -> String? {
+    for key in keys {
+        if let value = stringValue(properties[key]), !value.isEmpty { return value }
+    }
+    return nil
+}
+
+private func rawPropertyStrings(from properties: [String: Any]) -> [String: String] {
+    properties.compactMapValues { value -> String? in
+        if let string = value as? String { return string }
+        if let number = value as? NSNumber { return number.stringValue }
+        if let data = value as? Data, data.count < 128 {
+            return data.map { String(format: "%02X", $0) }.joined(separator: " ")
+        }
+        if let array = value as? [Any] {
+            return array.map { "\($0)" }.joined(separator: ", ")
+        }
+        if value is NSDictionary || value is [String: Any] { return nil }
+        return String(describing: value)
+    }
+}
+
+private func normalizedDescriptorPowerMilliamps(rawValue: Int, bcdUSB: Int) -> Int {
+    guard rawValue > 0 else { return 0 }
+    return bcdUSB >= 0x300 ? rawValue * 8 : rawValue * 2
+}
+
+private func formatBitsPerSecond(_ bitsPerSecond: Int64) -> String {
+    guard bitsPerSecond > 0 else { return "Unknown" }
+
+    let units: [(threshold: Double, suffix: String)] = [
+        (1_000_000_000, "Gbps"),
+        (1_000_000, "Mbps"),
+        (1_000, "Kbps")
+    ]
+
+    let value = Double(bitsPerSecond)
+    for unit in units where value >= unit.threshold {
+        let scaled = value / unit.threshold
+        if abs(scaled.rounded() - scaled) < 0.05 {
+            return "\(Int(scaled.rounded())) \(unit.suffix)"
+        }
+        return String(format: "%.1f %@", scaled, unit.suffix)
+    }
+
+    return "\(bitsPerSecond) bps"
+}
+
+// MARK: - USB Interface Model
+struct USBInterfaceInfo: Identifiable, Hashable {
+    let interfaceNumber: Int
+    let alternateSetting: Int
+    let interfaceClass: Int
+    let interfaceSubClass: Int
+    let interfaceProtocol: Int
+    let endpointCount: Int
+    let exclusiveOwner: String
+    let speed: USBSpeed
+    let rawProperties: [String: String]
+
+    var id: String {
+        "\(interfaceNumber)-\(alternateSetting)-\(interfaceClass)-\(interfaceSubClass)-\(interfaceProtocol)"
+    }
+
+    var classInfo: (name: String, description: String, icon: String, layman: String) {
+        usbClassDescriptions[interfaceClass] ?? ("Unknown Interface", "Unrecognized interface class", "questionmark.circle", "macOS exposed this interface, but its function isn't obvious")
+    }
+
+    var meaning: USBDescriptorMeaning {
+        descriptorMeaningFor(classCode: interfaceClass, subClass: interfaceSubClass, protocolCode: interfaceProtocol, isDeviceLevel: false)
+    }
+
+    var technicalSignature: String {
+        "Class \(hexByte(interfaceClass)) • Subclass \(hexByte(interfaceSubClass)) • Protocol \(hexByte(interfaceProtocol))"
+    }
+
+    var ownerExplanation: String? {
+        interfaceOwnerExplanation(exclusiveOwner)
+    }
+
+    var summary: String {
+        var parts = ["Interface \(interfaceNumber)"]
+        if endpointCount > 0 {
+            parts.append("\(endpointCount) endpoints")
+        }
+        if speed != .unknown {
+            parts.append(speed.shortDescription)
+        }
+        return parts.joined(separator: " • ")
+    }
+}
+
 // MARK: - USB Controller Model
 struct USBController: Identifiable, Hashable {
-    let id = UUID()
+    let id: String
     let name: String
     let className: String
     let locationID: UInt32
@@ -77,7 +1162,7 @@ struct USBController: Identifiable, Hashable {
 
 // MARK: - Thunderbolt Device Model
 struct ThunderboltDevice: Identifiable, Hashable {
-    let id = UUID()
+    let id: String
     let name: String
     let vendorName: String
     let deviceName: String
@@ -126,7 +1211,7 @@ struct ThunderboltDevice: Identifiable, Hashable {
 
 // MARK: - USB Device Model
 struct USBDevice: Identifiable, Hashable {
-    let id = UUID()
+    let id: String
     let name: String
     let vendorID: Int
     let productID: Int
@@ -138,7 +1223,9 @@ struct USBDevice: Identifiable, Hashable {
     let deviceSubClass: Int
     let deviceProtocol: Int
     let maxPower: Int
+    let descriptorMaxPowerMilliamps: Int
     let usbVersion: String
+    let bcdUSB: Int
     let locationID: UInt32
     let isHub: Bool
     let portCount: Int
@@ -152,12 +1239,411 @@ struct USBDevice: Identifiable, Hashable {
     let isInternal: Bool
     let sleepCurrent: Int
     let sessionID: UInt64
+    let currentConfiguration: Int
+    let linkSpeedBitsPerSecond: Int64
     let portType: String
     let parentControllerName: String
+    let interfaces: [USBInterfaceInfo]
     let rawProperties: [String: String]
+    var storageVolumes: [StorageVolumeInfo] = []
 
     var vendorIDHex: String { String(format: "0x%04X", vendorID) }
     var productIDHex: String { String(format: "0x%04X", productID) }
+    var negotiatedSpeedDescription: String {
+        if linkSpeedBitsPerSecond > 0 {
+            return formatBitsPerSecond(linkSpeedBitsPerSecond)
+        }
+        return speed.shortDescription
+    }
+
+    var logName: String {
+        if !serialNumber.isEmpty {
+            return "\(name) [\(serialNumber)]"
+        }
+        return name
+    }
+
+    var isCompositeDevice: Bool {
+        deviceClass == 0 && interfaces.count > 1
+    }
+
+    var effectiveClass: Int {
+        if deviceClass != 0 {
+            return deviceClass
+        }
+
+        let interfaceClasses = Set(interfaces.map(\.interfaceClass).filter { $0 != 0 })
+        if interfaceClasses.count == 1, let interfaceClass = interfaceClasses.first {
+            return interfaceClass
+        }
+
+        if !interfaces.isEmpty {
+            return 0
+        }
+
+        return -1
+    }
+
+    var classSource: String {
+        if deviceClass != 0 {
+            return "From the device descriptor"
+        }
+        if interfaces.isEmpty {
+            return "Composite device with no interface descriptors exposed"
+        }
+        let uniqueClasses = Set(interfaces.map(\.interfaceClass).filter { $0 != 0 })
+        if uniqueClasses.count == 1 {
+            return "Derived from interface descriptors"
+        }
+        return "Composite device exposing multiple interface types"
+    }
+
+    var isPerformanceLimited: Bool {
+        bcdUSB >= 0x300 && (speed == .low || speed == .full || speed == .high)
+    }
+
+    var vendorProfile: USBVendorProfile? {
+        lookupVendorProfile(vendorID: vendorID, vendorName: vendorName)
+    }
+
+    var productCatalogEntry: USBProductCatalogEntry? {
+        lookupProductCatalogEntry(vendorID: vendorID, vendorName: vendorName, productName: productName.isEmpty ? name : productName)
+    }
+
+    var vendorDisplayName: String {
+        if !vendorName.isEmpty { return vendorName }
+        return vendorProfile?.canonicalName ?? ""
+    }
+
+    var controllerGroupName: String {
+        parentControllerName.isEmpty ? "Unattributed USB Path" : parentControllerName
+    }
+
+    var portPathComponents: [Int] {
+        var path: [Int] = []
+        var loc = locationID >> 20
+        while loc > 0 {
+            let port = Int(loc & 0xF)
+            if port > 0 {
+                path.append(port)
+            }
+            loc >>= 4
+        }
+        return path.reversed()
+    }
+
+    var depthInTopology: Int {
+        portPathComponents.count
+    }
+
+    var mountedVolumes: [StorageVolumeInfo] {
+        storageVolumes.filter(\.isMounted)
+    }
+
+    var wholeDiskVolumes: [StorageVolumeInfo] {
+        storageVolumes.filter(\.isWholeDisk)
+    }
+
+    var sortedStorageVolumes: [StorageVolumeInfo] {
+        storageVolumes.sorted {
+            if $0.wholeDiskBSDName != $1.wholeDiskBSDName {
+                return $0.wholeDiskBSDName.localizedCaseInsensitiveCompare($1.wholeDiskBSDName) == .orderedAscending
+            }
+            if $0.isWholeDisk != $1.isWholeDisk {
+                return $0.isWholeDisk && !$1.isWholeDisk
+            }
+            if $0.isMounted != $1.isMounted {
+                return $0.isMounted && !$1.isMounted
+            }
+            return $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+        }
+    }
+
+    var volumeSummary: String {
+        let mountedCount = mountedVolumes.count
+        if mountedCount == 0 {
+            if !storageVolumes.isEmpty {
+                return "\(storageVolumes.count) disk objects found"
+            }
+            return "No Finder volumes mapped"
+        }
+        if mountedCount == 1, let volume = mountedVolumes.first {
+            return volume.displayName
+        }
+        return "\(mountedCount) mounted volumes"
+    }
+
+    var primaryMeaning: USBDescriptorMeaning {
+        if deviceClass == 0 {
+            if interfaces.count == 1, let interface = interfaces.first {
+                return interface.meaning
+            }
+
+            if interfaces.count > 1 {
+                return descriptorMeaningFor(classCode: 0, subClass: 0, protocolCode: 0, isDeviceLevel: true)
+            }
+        }
+
+        return descriptorMeaningFor(classCode: effectiveClass, subClass: deviceSubClass, protocolCode: deviceProtocol, isDeviceLevel: true)
+    }
+
+    var functionLabels: [String] {
+        let labels = interfaces.map { $0.meaning.technicalLabel.replacingOccurrences(of: " Interface", with: "") }
+        if !labels.isEmpty {
+            return orderedUniqueStrings(labels)
+        }
+
+        return orderedUniqueStrings([primaryMeaning.technicalLabel.replacingOccurrences(of: " Interface", with: "")])
+    }
+
+    var translatedCategory: String {
+        if let catalogCategory = productCatalogEntry?.category {
+            return catalogCategory
+        }
+
+        if let hint = productCategoryHint(vendorID: vendorID, vendorName: vendorName, productName: productName.isEmpty ? name : productName, meaning: primaryMeaning, isHub: isHub) {
+            return hint
+        }
+
+        if isCompositeDevice {
+            return "Multi-function USB device"
+        }
+
+        return primaryMeaning.technicalLabel
+    }
+
+    var translationHeadline: String {
+        if isCompositeDevice {
+            let functionSummary = naturalLanguageList(Array(functionLabels.prefix(3)))
+            if !functionSummary.isEmpty {
+                return "Multi-function device: \(functionSummary)"
+            }
+        }
+
+        return translatedCategory
+    }
+
+    var rowSubtitle: String {
+        var parts: [String] = []
+
+        if !vendorDisplayName.isEmpty {
+            parts.append(vendorDisplayName)
+        }
+
+        parts.append(translatedCategory)
+
+        if isCompositeDevice {
+            let functionSummary = naturalLanguageList(Array(functionLabels.prefix(2)))
+            if !functionSummary.isEmpty {
+                parts.append(functionSummary)
+            }
+        } else if primaryMeaning.technicalLabel != translatedCategory {
+            parts.append(primaryMeaning.technicalLabel)
+        }
+
+        if !mountedVolumes.isEmpty {
+            parts.append(volumeSummary)
+        }
+
+        return orderedUniqueStrings(parts).joined(separator: " • ")
+    }
+
+    var translationSummary: String {
+        var sentences: [String] = []
+        let productLabel = productName.isEmpty ? name : productName
+
+        if !productLabel.isEmpty && productLabel != translatedCategory {
+            sentences.append("macOS identifies this device as “\(productLabel)”.")
+        }
+
+        if isCompositeDevice {
+            let functionSummary = naturalLanguageList(functionLabels)
+            if !functionSummary.isEmpty {
+                sentences.append("This one physical USB address exposes \(interfaces.count) separate interfaces that together look like \(functionSummary).")
+            } else {
+                sentences.append("This one physical USB address exposes \(interfaces.count) separate interfaces.")
+            }
+            sentences.append("Because the top-level device class is interface-defined, the interface breakdown below is more trustworthy than the device-class byte alone.")
+        } else {
+            sentences.append(primaryMeaning.plainEnglish)
+            sentences.append(primaryMeaning.macBehavior)
+        }
+
+        if isPerformanceLimited {
+            sentences.append("It advertises USB \(usbVersion), but the current connection negotiated at only \(negotiatedSpeedDescription).")
+        }
+
+        if !mountedVolumes.isEmpty {
+            let volumeNames = naturalLanguageList(mountedVolumes.map(\.displayName))
+            if !volumeNames.isEmpty {
+                sentences.append("Finder currently maps this device to \(volumeNames).")
+            }
+        }
+
+        return sentences.joined(separator: " ")
+    }
+
+    var vendorContext: String? {
+        let productHint = specificProductHint(vendorID: vendorID, vendorName: vendorName, productName: productName.isEmpty ? name : productName)
+
+        if let productCatalogEntry {
+            var parts = [productCatalogEntry.summary]
+            if let vendorProfile {
+                parts.append(vendorProfile.companySummary)
+                parts.append(vendorProfile.usbContext)
+            }
+            if let productHint {
+                parts.append(productHint)
+            }
+            return orderedUniqueStrings(parts).joined(separator: " ")
+        }
+
+        if let vendorProfile {
+            if let productHint {
+                return "\(vendorProfile.companySummary) \(vendorProfile.usbContext) \(productHint)"
+            }
+            return "\(vendorProfile.companySummary) \(vendorProfile.usbContext)"
+        }
+
+        return productHint
+    }
+
+    var userFacingBehaviors: [String] {
+        let tagSet = Set(interfaces.flatMap { $0.meaning.tags } + primaryMeaning.tags)
+        var behaviors: [String] = []
+
+        if isCompositeDevice {
+            behaviors.append("macOS can split this one physical accessory into several logical interfaces, each with its own driver and purpose.")
+        }
+        if tagSet.contains("storage") {
+            behaviors.append("Should behave like external storage in Finder, Disk Utility, backup tools, or file-copy workflows.")
+        }
+        if tagSet.contains("audio") {
+            behaviors.append("Should show up in Sound settings or pro-audio apps as audio input/output or MIDI-related hardware.")
+        }
+        if tagSet.contains("video") || tagSet.contains("camera") {
+            behaviors.append("Should appear to camera, conferencing, or capture apps as a video source instead of as a disk.")
+        }
+        if tagSet.contains("network") || tagSet.contains("communication") {
+            behaviors.append("May create a network/tethering-style interface in macOS instead of a Finder-visible device.")
+        }
+        if tagSet.contains("hid") || tagSet.contains("input") {
+            behaviors.append("Feeds input events into macOS rather than exposing a filesystem or media volume.")
+        }
+        if tagSet.contains("bluetooth") {
+            behaviors.append("Acts as transport for the Bluetooth stack rather than as a user-facing USB app/device on its own.")
+        }
+        if tagSet.contains("hub") {
+            behaviors.append("Everything plugged downstream shares this upstream path's speed, latency, and power constraints.")
+        }
+        if tagSet.contains("usb-c") || tagSet.contains("billboard") {
+            behaviors.append("Mostly exists to describe USB-C or alternate-mode capability state, not to move normal user data.")
+        }
+        if tagSet.contains("firmware") || tagSet.contains("recovery") {
+            behaviors.append("Mostly matters during firmware update, restore, or maintenance workflows.")
+        }
+        if tagSet.contains("vendor-specific") {
+            behaviors.append("May require a vendor app, DriverKit extension, or specialist utility before it becomes useful.")
+        }
+        if !mountedVolumes.isEmpty {
+            behaviors.append("Finder currently maps this USB device to \(volumeSummary), so you can tell which mounted storage falls under this physical device.")
+        }
+
+        if behaviors.isEmpty {
+            behaviors.append(primaryMeaning.macBehavior)
+        }
+
+        return orderedUniqueStrings(behaviors)
+    }
+
+    var translatedHighlights: [String] {
+        var highlights: [String] = []
+
+        if let productHint = specificProductHint(vendorID: vendorID, vendorName: vendorName, productName: productName.isEmpty ? name : productName) {
+            highlights.append(productHint)
+        }
+
+        if let productCatalogEntry {
+            highlights.append(contentsOf: productCatalogEntry.highlights)
+        }
+
+        if isCompositeDevice {
+            let functionSummary = naturalLanguageList(functionLabels)
+            if !functionSummary.isEmpty {
+                highlights.append("Interface mix: \(functionSummary).")
+            }
+        } else {
+            highlights.append(primaryMeaning.uniqueness)
+        }
+
+        if let ownerExplanation = interfaces.compactMap(\.ownerExplanation).first {
+            highlights.append(ownerExplanation)
+        }
+
+        if interfaces.contains(where: { $0.meaning.tags.contains("uas") }) {
+            highlights.append("This device is speaking UAS, the newer queued USB storage transport favored by faster SSDs and enclosures.")
+        }
+
+        if interfaces.contains(where: { $0.meaning.tags.contains("bot") }) {
+            highlights.append("This device is using BOT, the older compatibility storage transport, rather than UAS.")
+        }
+
+        if isPerformanceLimited {
+            highlights.append("Performance note: the descriptors advertise USB \(usbVersion), but this link is currently only \(negotiatedSpeedDescription).")
+        }
+
+        if descriptorMaxPowerMilliamps > 0 {
+            if maxPower > 0 && descriptorMaxPowerMilliamps != maxPower {
+                highlights.append("Power note: the descriptor asks for \(descriptorMaxPowerMilliamps) mA, and macOS negotiated \(maxPower) mA.")
+            } else {
+                highlights.append("Power note: the descriptor asks for \(descriptorMaxPowerMilliamps) mA.")
+            }
+        }
+
+        if !mountedVolumes.isEmpty {
+            highlights.append("Volume map: \(naturalLanguageList(mountedVolumes.map(\.displayName)))")
+        }
+
+        return orderedUniqueStrings(highlights)
+    }
+
+    var translationBadges: [String] {
+        var badges = [translatedCategory]
+
+        if let productCatalogEntry {
+            badges.append(contentsOf: productCatalogEntry.badges)
+        }
+
+        if isCompositeDevice {
+            badges.append("Composite")
+        } else if primaryMeaning.technicalLabel != translatedCategory {
+            badges.append(primaryMeaning.technicalLabel.replacingOccurrences(of: " Interface", with: ""))
+        }
+
+        if interfaces.contains(where: { $0.meaning.tags.contains("uas") }) {
+            badges.append("UAS")
+        }
+        if interfaces.contains(where: { $0.meaning.tags.contains("bot") }) {
+            badges.append("BOT")
+        }
+        if interfaces.contains(where: { $0.meaning.tags.contains("bluetooth") }) {
+            badges.append("Bluetooth")
+        }
+        if interfaces.contains(where: { $0.meaning.tags.contains("midi") }) {
+            badges.append("MIDI")
+        }
+        if !mountedVolumes.isEmpty {
+            badges.append("Finder-mapped")
+        }
+
+        badges.append(negotiatedSpeedDescription)
+        return orderedUniqueStrings(badges)
+    }
+
+    var translationSearchText: String {
+        let volumeTerms = storageVolumes.flatMap { [$0.displayName, $0.mountPath, $0.bsdName, $0.wholeDiskBSDName] }
+        return ([rowSubtitle, translationHeadline, translationSummary, vendorContext ?? ""] + userFacingBehaviors + translatedHighlights + functionLabels + volumeTerms).joined(separator: " ")
+    }
 
     var bcdDeviceString: String {
         if bcdDevice > 0 {
@@ -172,9 +1658,16 @@ struct USBDevice: Identifiable, Hashable {
     var powerDescription: String {
         if maxPower > 0 {
             let watts = Double(maxPower) * 5.0 / 1000.0
-            return "\(maxPower) mA (\(String(format: "%.2f", watts)) W @ 5V)"
+            return "\(maxPower) mA budget (\(String(format: "%.2f", watts)) W @ 5V)"
         }
         return "N/A"
+    }
+
+    var descriptorPowerDescription: String {
+        if descriptorMaxPowerMilliamps > 0 {
+            return "\(descriptorMaxPowerMilliamps) mA requested in descriptor"
+        }
+        return "Not reported"
     }
 
     var powerAvailableDescription: String {
@@ -187,7 +1680,10 @@ struct USBDevice: Identifiable, Hashable {
     }
 
     var classInfo: (name: String, description: String, icon: String, layman: String) {
-        usbClassDescriptions[deviceClass] ?? ("Unknown Type", "Unrecognized device class", "questionmark.circle", "We couldn't identify what type of device this is")
+        if effectiveClass == -1 {
+            return ("Unknown Type", "macOS did not expose enough descriptor information to classify this device", "questionmark.circle", "We couldn't identify what type of device this is yet")
+        }
+        return usbClassDescriptions[effectiveClass] ?? ("Unknown Type", "Unrecognized device class", "questionmark.circle", "We couldn't identify what type of device this is")
     }
 
     var theoreticalBandwidth: (speed: String, practical: String, realWorld: String) {
@@ -198,6 +1694,7 @@ struct USBDevice: Identifiable, Hashable {
         case .super_: return ("5 Gbps", "~400-450 MB/s", "Fast USB 3.0 – a 1GB file takes ~2-3 seconds")
         case .superPlus: return ("10 Gbps", "~900-1000 MB/s", "Very fast – a 1GB file in about 1 second")
         case .superPlusBy2: return ("20 Gbps", "~2000 MB/s", "Blazing fast – a 4K movie in seconds")
+        case .usb4: return ("40 Gbps", "~3500-4000 MB/s", "USB4-class performance for high-end storage, docks, and displays")
         case .unknown: return ("Unknown", "N/A", "Speed couldn't be determined")
         }
     }
@@ -207,23 +1704,38 @@ struct USBDevice: Identifiable, Hashable {
         var issues: [String] = []
 
         if speed == .unknown {
-            score -= 40
-            issues.append("⚠️ Can't detect speed – try a different port or cable")
+            score -= 35
+            issues.append("⚠️ macOS did not expose a negotiated USB speed for this device")
         }
 
-        if maxPower > 0 && busPowerAvailable > 0 && maxPower > busPowerAvailable {
+        if descriptorMaxPowerMilliamps > 0 && busPowerAvailable > 0 && descriptorMaxPowerMilliamps > busPowerAvailable {
             score -= 25
-            issues.append("🔌 Needs more power than the port provides – device may not work properly or charge slowly")
+            issues.append("🔌 The device requests \(descriptorMaxPowerMilliamps) mA, but the port only advertises \(busPowerAvailable) mA")
+        } else if maxPower > 0 && busPowerAvailable > 0 && maxPower > busPowerAvailable {
+            score -= 15
+            issues.append("🔋 The negotiated power budget is larger than the port's advertised budget")
         }
 
         if vendorID == 0 && productID == 0 {
-            score -= 20
-            issues.append("❓ Device didn't identify itself – could be a cheap/counterfeit cable or device")
+            score -= 15
+            issues.append("❓ The device did not publish vendor/product IDs, which usually means incomplete descriptors")
         }
 
-        if serialNumber.isEmpty && !isHub {
-            score -= 5
-            issues.append("ℹ️ No serial number – minor issue, won't affect performance")
+        if isPerformanceLimited {
+            score -= 25
+            issues.append("🐢 This device advertises USB \(usbVersion) capability but negotiated below SuperSpeed – the cable, port, or hub is likely limiting it")
+        }
+
+        if deviceClass == 0 && interfaces.isEmpty {
+            score -= 10
+            issues.append("🧩 The device reports itself as composite, but macOS did not expose interface descriptors to classify it")
+        } else if isCompositeDevice {
+            issues.append("🧩 Composite device exposing \(interfaces.count) separate USB interfaces")
+        }
+
+        if serialNumber.isEmpty && !isHub && !isInternal {
+            score -= 3
+            issues.append("ℹ️ No serial number was published for this external device")
         }
 
         let rating: String
@@ -252,20 +1764,39 @@ struct USBDevice: Identifiable, Hashable {
     }
 
     var locationDescription: String {
-        // Decode location ID into port path
-        var path: [Int] = []
-        var loc = locationID >> 20 // Skip controller bits
-        while loc > 0 {
-            let port = Int(loc & 0xF)
-            if port > 0 {
-                path.append(port)
-            }
-            loc >>= 4
-        }
-        if path.isEmpty {
+        if portPathComponents.isEmpty {
             return "Root"
         }
-        return path.map { String($0) }.joined(separator: " → ")
+        return portPathComponents.map(String.init).joined(separator: " → ")
+    }
+
+    var hierarchyPathLabel: String {
+        if portPathComponents.isEmpty {
+            return "Root path"
+        }
+
+        let label = portPathComponents.count == 1 ? "Port" : "Path"
+        return "\(label) \(locationDescription)"
+    }
+
+    var hierarchyIdentityLine: String {
+        var parts = [hierarchyPathLabel]
+
+        if vendorID != 0 || productID != 0 {
+            parts.append("\(vendorIDHex):\(productIDHex)")
+        }
+
+        if !serialNumber.isEmpty {
+            parts.append("SN \(serialNumber)")
+        } else if let volume = mountedVolumes.first {
+            parts.append(volume.displayName)
+        } else if let volume = sortedStorageVolumes.first {
+            parts.append(volume.wholeDiskBSDName)
+        } else if isInternal {
+            parts.append("Internal")
+        }
+
+        return orderedUniqueStrings(parts).joined(separator: " • ")
     }
 }
 
@@ -278,6 +1809,55 @@ enum USBSpeed: Int, CaseIterable {
     case super_ = 3       // 5 Gbps
     case superPlus = 4    // 10 Gbps
     case superPlusBy2 = 5 // 20 Gbps
+    case usb4 = 6         // 40 Gbps
+
+    static func resolve(deviceSpeed: Int?, usbSpeed: Int?, linkSpeedBitsPerSecond: Int64) -> USBSpeed {
+        if linkSpeedBitsPerSecond >= 40_000_000_000 { return .usb4 }
+        if linkSpeedBitsPerSecond >= 20_000_000_000 { return .superPlusBy2 }
+        if linkSpeedBitsPerSecond >= 10_000_000_000 { return .superPlus }
+        if linkSpeedBitsPerSecond >= 5_000_000_000 { return .super_ }
+        if linkSpeedBitsPerSecond >= 480_000_000 { return .high }
+        if linkSpeedBitsPerSecond >= 12_000_000 { return .full }
+        if linkSpeedBitsPerSecond >= 1_500_000 { return .low }
+
+        if let deviceSpeed {
+            switch deviceSpeed {
+            case 0: return .low
+            case 1: return .full
+            case 2: return .high
+            case 3: return .super_
+            case 4: return .superPlus
+            case 5: return .superPlusBy2
+            default: break
+            }
+        }
+
+        if let usbSpeed {
+            switch usbSpeed {
+            case 0: return .low
+            case 1: return .full
+            case 2: return .high
+            case 3: return .super_
+            case 4, 5: return .superPlus
+            default: break
+            }
+        }
+
+        return .unknown
+    }
+
+    var nominalBitsPerSecond: Int64? {
+        switch self {
+        case .unknown: return nil
+        case .low: return 1_500_000
+        case .full: return 12_000_000
+        case .high: return 480_000_000
+        case .super_: return 5_000_000_000
+        case .superPlus: return 10_000_000_000
+        case .superPlusBy2: return 20_000_000_000
+        case .usb4: return 40_000_000_000
+        }
+    }
 
     var description: String {
         switch self {
@@ -288,6 +1868,7 @@ enum USBSpeed: Int, CaseIterable {
         case .super_: return "SuperSpeed (USB 3.0)"
         case .superPlus: return "SuperSpeed+ (USB 3.1/3.2)"
         case .superPlusBy2: return "SuperSpeed+ 2x2 (USB 3.2)"
+        case .usb4: return "USB4 (40 Gbps class)"
         }
     }
 
@@ -300,6 +1881,7 @@ enum USBSpeed: Int, CaseIterable {
         case .super_: return "Fast – great for flash drives and external storage"
         case .superPlus: return "Very Fast – excellent for SSDs and video capture"
         case .superPlusBy2: return "Blazing Fast – top-tier speed for demanding tasks"
+        case .usb4: return "Extreme – workstation-class USB performance for top-end docks and storage"
         }
     }
 
@@ -312,6 +1894,7 @@ enum USBSpeed: Int, CaseIterable {
         case .super_: return "5 Gbps"
         case .superPlus: return "10 Gbps"
         case .superPlusBy2: return "20 Gbps"
+        case .usb4: return "40 Gbps"
         }
     }
 
@@ -324,6 +1907,7 @@ enum USBSpeed: Int, CaseIterable {
         case .super_: return .green
         case .superPlus: return .blue
         case .superPlusBy2: return .purple
+        case .usb4: return .indigo
         }
     }
 
@@ -335,6 +1919,7 @@ enum USBSpeed: Int, CaseIterable {
         case .super_: return "3.0/3.1 Gen 1"
         case .superPlus: return "3.1 Gen 2/3.2 Gen 2"
         case .superPlusBy2: return "3.2 Gen 2x2"
+        case .usb4: return "USB4"
         }
     }
 
@@ -344,6 +1929,7 @@ enum USBSpeed: Int, CaseIterable {
         case .low, .full: return "100 mA (0.5W)"
         case .high: return "500 mA (2.5W)"
         case .super_, .superPlus, .superPlusBy2: return "900 mA (4.5W) / Up to 3A with USB-C PD"
+        case .usb4: return "USB4 base power with USB-C PD support for much higher delivery"
         }
     }
 
@@ -356,6 +1942,7 @@ enum USBSpeed: Int, CaseIterable {
         case .super_: return "bolt.fill"
         case .superPlus: return "bolt.horizontal.fill"
         case .superPlusBy2: return "bolt.horizontal.circle.fill"
+        case .usb4: return "bolt.badge.clock"
         }
     }
 }
@@ -398,7 +1985,7 @@ class USBManager: ObservableObject {
         let runLoopSource = IONotificationPortGetRunLoopSource(port).takeUnretainedValue()
         CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .defaultMode)
 
-        let matchingDict = IOServiceMatching(kIOUSBDeviceClassName)
+        let matchingDict = IOServiceMatching("IOUSBHostDevice")
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
 
         IOServiceAddMatchingNotification(port, kIOFirstMatchNotification, matchingDict,
@@ -412,7 +1999,7 @@ class USBManager: ObservableObject {
 
         while case let device = IOIteratorNext(addedIterator), device != 0 { IOObjectRelease(device) }
 
-        let matchingDict2 = IOServiceMatching(kIOUSBDeviceClassName)
+        let matchingDict2 = IOServiceMatching("IOUSBHostDevice")
         IOServiceAddMatchingNotification(port, kIOTerminatedNotification, matchingDict2,
             { (refcon, iterator) in
                 while case let device = IOIteratorNext(iterator), device != 0 { IOObjectRelease(device) }
@@ -435,11 +2022,23 @@ class USBManager: ObservableObject {
             let thunderbolt = self?.scanThunderboltDevices() ?? []
 
             DispatchQueue.main.async {
+                let previousDevices = self?.devices ?? []
+                let previousDeviceLookup = Dictionary(uniqueKeysWithValues: previousDevices.map { ($0.id, $0) })
+                let currentDeviceLookup = Dictionary(uniqueKeysWithValues: devices.map { ($0.id, $0) })
+                let connectedDevices = devices.filter { previousDeviceLookup[$0.id] == nil }
+                let disconnectedDevices = previousDevices.filter { currentDeviceLookup[$0.id] == nil }
+
                 self?.devices = devices
                 self?.controllers = controllers
                 self?.thunderboltDevices = thunderbolt
                 self?.lastUpdated = Date()
                 self?.isScanning = false
+                if !connectedDevices.isEmpty {
+                    self?.log("Connected: \(connectedDevices.map(\.logName).joined(separator: ", "))")
+                }
+                if !disconnectedDevices.isEmpty {
+                    self?.log("Disconnected: \(disconnectedDevices.map(\.logName).joined(separator: ", "))")
+                }
                 self?.log("Scan complete: \(devices.count) USB devices, \(controllers.count) controllers, \(thunderbolt.count) Thunderbolt devices")
             }
         }
@@ -447,7 +2046,7 @@ class USBManager: ObservableObject {
 
     // MARK: - Scan USB Controllers
     private func scanUSBControllers() -> [USBController] {
-        var controllers: [USBController] = []
+        var controllersByID: [String: USBController] = [:]
 
         let controllerClasses = ["AppleUSBXHCI", "AppleUSBEHCI", "AppleUSBOHCI", "AppleUSBUHCI", "IOUSBController", "AppleUSB20XHCIPort", "IOUSBHostController"]
 
@@ -462,13 +2061,13 @@ class USBManager: ObservableObject {
                     defer { IOObjectRelease(service) }
 
                     if let controller = createController(from: service, className: className) {
-                        controllers.append(controller)
+                        controllersByID[controller.id] = controller
                     }
                 }
             }
         }
 
-        return controllers
+        return controllersByID.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
     private func createController(from service: io_service_t, className: String) -> USBController? {
@@ -482,30 +2081,27 @@ class USBManager: ObservableObject {
             name = String(cString: nameBuffer)
         }
 
-        let busPower = props["Bus Power Available"] as? Int ?? props["AAPL,current-available"] as? Int ?? 0
-        let locationID = (props["locationID"] as? NSNumber)?.uint32Value ?? 0
-        let isBuiltIn = props["Built-In"] as? Bool ?? (props["built-in"] != nil)
+        let busPower = firstInt(in: props, keys: ["Bus Power Available", "AAPL,current-available"]) ?? 0
+        let locationID = firstUInt32(in: props, keys: ["locationID"]) ?? 0
+        let isBuiltIn = firstBool(in: props, keys: ["Built-In", "built-in"]) ?? (props["built-in"] != nil)
 
         var controllerType = "Unknown"
         if className.contains("XHCI") { controllerType = "xHCI (USB 3.0+)" }
         else if className.contains("EHCI") { controllerType = "EHCI (USB 2.0)" }
         else if className.contains("OHCI") || className.contains("UHCI") { controllerType = "OHCI/UHCI (USB 1.x)" }
 
-        let rawProps = props.compactMapValues { value -> String? in
-            if let str = value as? String { return str }
-            if let num = value as? NSNumber { return num.stringValue }
-            if let data = value as? Data { return data.map { String(format: "%02X", $0) }.joined(separator: " ") }
-            return nil
-        }
+        let rawProps = rawPropertyStrings(from: props)
+        let stableID = locationID > 0 ? "controller-\(String(format: "%08X", locationID))" : "controller-\(name)"
 
         return USBController(
+            id: stableID,
             name: name,
             className: className,
             locationID: locationID,
             busPowerAvailable: busPower,
             isBuiltIn: isBuiltIn,
             controllerType: controllerType,
-            pciInfo: props["pcidebug"] as? String ?? "",
+            pciInfo: firstString(in: props, keys: ["pcidebug"]) ?? "",
             supportsUSB3: className.contains("XHCI") || name.contains("3.0"),
             rawProperties: rawProps
         )
@@ -513,7 +2109,7 @@ class USBManager: ObservableObject {
 
     // MARK: - Scan Thunderbolt
     private func scanThunderboltDevices() -> [ThunderboltDevice] {
-        var devices: [ThunderboltDevice] = []
+        var devicesByID: [String: ThunderboltDevice] = [:]
 
         let matchingDict = IOServiceMatching("IOThunderboltPort")
         var iterator: io_iterator_t = 0
@@ -525,7 +2121,7 @@ class USBManager: ObservableObject {
                 defer { IOObjectRelease(service) }
 
                 if let tbDevice = createThunderboltDevice(from: service) {
-                    devices.append(tbDevice)
+                    devicesByID[tbDevice.id] = tbDevice
                 }
             }
         }
@@ -540,12 +2136,12 @@ class USBManager: ObservableObject {
                 defer { IOObjectRelease(service) }
 
                 if let tbDevice = createThunderboltDevice(from: service) {
-                    devices.append(tbDevice)
+                    devicesByID[tbDevice.id] = tbDevice
                 }
             }
         }
 
-        return devices
+        return devicesByID.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
     private func createThunderboltDevice(from service: io_service_t) -> ThunderboltDevice? {
@@ -559,56 +2155,232 @@ class USBManager: ObservableObject {
             name = String(cString: nameBuffer)
         }
 
-        let uid = props["UID"] as? String ?? props["Thunderbolt Device UID"] as? String ?? ""
-        let vendorName = props["Device Vendor Name"] as? String ?? props["Vendor Name"] as? String ?? ""
-        let deviceName = props["Device Model Name"] as? String ?? props["Device Name"] as? String ?? name
+        let uid = firstString(in: props, keys: ["UID", "Thunderbolt Device UID"]) ?? ""
+        let vendorName = firstString(in: props, keys: ["Device Vendor Name", "Vendor Name"]) ?? ""
+        let deviceName = firstString(in: props, keys: ["Device Model Name", "Device Name"]) ?? name
 
-        var generation = 3
-        if let gen = props["Thunderbolt Generation"] as? Int { generation = gen }
+        var generation = 0
+        if let gen = firstInt(in: props, keys: ["Thunderbolt Generation"]) { generation = gen }
         else if name.contains("Thunderbolt 4") || vendorName.contains("Thunderbolt 4") { generation = 4 }
         else if name.contains("Thunderbolt 3") { generation = 3 }
         else if name.contains("Thunderbolt 2") { generation = 2 }
         else if name.contains("Thunderbolt 1") || name.contains("Light Peak") { generation = 1 }
 
-        let rawProps = props.compactMapValues { value -> String? in
-            if let str = value as? String { return str }
-            if let num = value as? NSNumber { return num.stringValue }
-            if let data = value as? Data, data.count < 100 { return data.map { String(format: "%02X", $0) }.joined(separator: " ") }
-            return nil
+        let routeString = firstString(in: props, keys: ["Route String"]) ?? String(firstInt(in: props, keys: ["Route String", "Port Number"]) ?? 0)
+        let rawProps = rawPropertyStrings(from: props)
+        let stableID: String
+        if !uid.isEmpty {
+            stableID = uid
+        } else if !routeString.isEmpty {
+            stableID = "tb-\(routeString)-\(name)"
+        } else {
+            stableID = "tb-\(name)"
         }
 
         return ThunderboltDevice(
+            id: stableID,
             name: name,
             vendorName: vendorName,
             deviceName: deviceName,
             uid: uid,
-            routeString: props["Route String"] as? String ?? "",
-            linkSpeed: props["Link Speed"] as? Int ?? 0,
-            linkWidth: props["Link Width"] as? Int ?? 0,
+            routeString: routeString,
+            linkSpeed: firstInt(in: props, keys: ["Link Speed"]) ?? 0,
+            linkWidth: firstInt(in: props, keys: ["Link Width"]) ?? 0,
             generation: generation,
-            isConnected: props["Power State"] as? Int ?? 1 > 0,
+            isConnected: (firstInt(in: props, keys: ["Power State"]) ?? 1) > 0,
             rawProperties: rawProps
         )
     }
 
     // MARK: - Scan USB Devices
     private func scanUSBDevices() -> [USBDevice] {
-        var devices: [USBDevice] = []
+        let storageVolumesByDevice = scanStorageVolumes()
+        var devicesByID: [String: USBDevice] = [:]
 
-        let matchingDict = IOServiceMatching(kIOUSBDeviceClassName)
-        var iterator: io_iterator_t = 0
+        for className in ["IOUSBHostDevice", kIOUSBDeviceClassName] {
+            let matchingDict = IOServiceMatching(className)
+            var iterator: io_iterator_t = 0
 
-        guard IOServiceGetMatchingServices(kIOMainPortDefault, matchingDict, &iterator) == KERN_SUCCESS else { return devices }
-        defer { IOObjectRelease(iterator) }
+            guard IOServiceGetMatchingServices(kIOMainPortDefault, matchingDict, &iterator) == KERN_SUCCESS else { continue }
+            defer { IOObjectRelease(iterator) }
 
-        while case let usbDevice = IOIteratorNext(iterator), usbDevice != 0 {
-            defer { IOObjectRelease(usbDevice) }
-            if let device = createUSBDevice(from: usbDevice) {
-                devices.append(device)
+            while case let usbDevice = IOIteratorNext(iterator), usbDevice != 0 {
+                defer { IOObjectRelease(usbDevice) }
+                if var device = createUSBDevice(from: usbDevice) {
+                    device.storageVolumes = storageVolumesByDevice[device.id] ?? []
+                    devicesByID[device.id] = device
+                }
             }
         }
 
-        return devices.sorted { $0.name.lowercased() < $1.name.lowercased() }
+        return devicesByID.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private func scanStorageVolumes() -> [String: [StorageVolumeInfo]] {
+        guard let session = DASessionCreate(kCFAllocatorDefault) else { return [:] }
+
+        var volumesByDevice: [String: [StorageVolumeInfo]] = [:]
+        let matchingDict = IOServiceMatching(kIOMediaClass)
+        var iterator: io_iterator_t = 0
+
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, matchingDict, &iterator) == KERN_SUCCESS else {
+            return [:]
+        }
+        defer { IOObjectRelease(iterator) }
+
+        while case let media = IOIteratorNext(iterator), media != 0 {
+            defer { IOObjectRelease(media) }
+
+            guard let volume = createStorageVolume(from: media, session: session) else { continue }
+
+            var stableID = resolveUSBDeviceStableID(for: media)
+
+            if stableID == nil && !volume.wholeDiskBSDName.isEmpty && volume.wholeDiskBSDName != volume.bsdName {
+                if let wholeDiskMatch = IOBSDNameMatching(kIOMainPortDefault, 0, volume.wholeDiskBSDName) {
+                    var wholeIterator: io_iterator_t = 0
+                    if IOServiceGetMatchingServices(kIOMainPortDefault, wholeDiskMatch, &wholeIterator) == KERN_SUCCESS {
+                        defer { IOObjectRelease(wholeIterator) }
+                        let wholeMedia = IOIteratorNext(wholeIterator)
+                        if wholeMedia != 0 {
+                            stableID = resolveUSBDeviceStableID(for: wholeMedia)
+                            IOObjectRelease(wholeMedia)
+                        }
+                    }
+                }
+            }
+
+            guard let stableID else { continue }
+            volumesByDevice[stableID, default: []].append(volume)
+        }
+
+        for key in volumesByDevice.keys {
+            volumesByDevice[key]?.sort {
+                if $0.wholeDiskBSDName != $1.wholeDiskBSDName {
+                    return $0.wholeDiskBSDName.localizedCaseInsensitiveCompare($1.wholeDiskBSDName) == .orderedAscending
+                }
+                if $0.isWholeDisk != $1.isWholeDisk {
+                    return $0.isWholeDisk && !$1.isWholeDisk
+                }
+                if $0.isMounted != $1.isMounted {
+                    return $0.isMounted && !$1.isMounted
+                }
+                return $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+            }
+        }
+
+        return volumesByDevice
+    }
+
+    private func createStorageVolume(from media: io_service_t, session: DASession) -> StorageVolumeInfo? {
+        guard let disk = DADiskCreateFromIOMedia(kCFAllocatorDefault, session, media) else { return nil }
+        guard let bsdPointer = DADiskGetBSDName(disk) else { return nil }
+
+        let description = DADiskCopyDescription(disk) as? [String: Any] ?? [:]
+        let bsdName = String(cString: bsdPointer)
+        let wholeDiskBSDName: String
+        if let wholeDisk = DADiskCopyWholeDisk(disk), let wholeBSDName = DADiskGetBSDName(wholeDisk) {
+            wholeDiskBSDName = String(cString: wholeBSDName)
+        } else {
+            wholeDiskBSDName = bsdName
+        }
+
+        let volumeURL = description[kDADiskDescriptionVolumePathKey as String] as? URL
+        var capacityBytes = firstUInt64(in: description, keys: [kDADiskDescriptionMediaSizeKey as String]).map(Int64.init) ?? 0
+        var availableBytes: Int64 = 0
+
+        if let volumeURL,
+           let resourceValues = try? volumeURL.resourceValues(forKeys: [.volumeAvailableCapacityKey, .volumeTotalCapacityKey]) {
+            if let total = resourceValues.volumeTotalCapacity {
+                capacityBytes = Int64(total)
+            }
+            if let available = resourceValues.volumeAvailableCapacity {
+                availableBytes = Int64(available)
+            }
+        }
+
+        let fileSystem = firstString(in: description, keys: [kDADiskDescriptionVolumeKindKey as String]) ?? ""
+        let volumeName = firstString(in: description, keys: [kDADiskDescriptionVolumeNameKey as String]) ?? ""
+        let mediaName = firstString(in: description, keys: [kDADiskDescriptionMediaNameKey as String]) ?? ""
+        let mountPath = volumeURL?.path ?? ""
+        let isWholeDisk = firstBool(in: description, keys: [kDADiskDescriptionMediaWholeKey as String]) ?? false
+        let isLeaf = firstBool(in: description, keys: [kDADiskDescriptionMediaLeafKey as String]) ?? false
+        let isMounted = !mountPath.isEmpty
+
+        if !isWholeDisk && !isMounted && fileSystem.isEmpty && !isLeaf {
+            return nil
+        }
+
+        return StorageVolumeInfo(
+            bsdName: bsdName,
+            wholeDiskBSDName: wholeDiskBSDName,
+            volumeName: volumeName,
+            mediaName: mediaName,
+            fileSystem: fileSystem,
+            mountPath: mountPath,
+            capacityBytes: capacityBytes,
+            availableBytes: availableBytes,
+            isWholeDisk: isWholeDisk,
+            isMounted: isMounted,
+            isLeaf: isLeaf,
+            deviceModel: firstString(in: description, keys: [kDADiskDescriptionDeviceModelKey as String]) ?? "",
+            deviceProtocol: firstString(in: description, keys: [kDADiskDescriptionDeviceProtocolKey as String]) ?? "",
+            volumeUUID: (description[kDADiskDescriptionVolumeUUIDKey as String] as? UUID)?.uuidString ?? "",
+            mediaUUID: (description[kDADiskDescriptionMediaUUIDKey as String] as? UUID)?.uuidString ?? ""
+        )
+    }
+
+    private func resolveUSBDeviceStableID(for service: io_service_t) -> String? {
+        var current = service
+        var shouldReleaseCurrent = false
+
+        while true {
+            if IOObjectConformsTo(current, "IOUSBHostDevice") != 0 || IOObjectConformsTo(current, kIOUSBDeviceClassName) != 0 {
+                let properties = registryProperties(for: current) ?? [:]
+                let vendorID = firstInt(in: properties, keys: [kUSBVendorID]) ?? 0
+                let productID = firstInt(in: properties, keys: [kUSBProductID]) ?? 0
+                let serialNumber = firstString(in: properties, keys: [kUSBSerialNumberString, "kUSBSerialNumberString"]) ?? ""
+                let sessionID = firstUInt64(in: properties, keys: ["sessionID"]) ?? 0
+                let locationID = firstUInt32(in: properties, keys: [kUSBDevicePropertyLocationID]) ?? 0
+                let fallbackName = firstString(in: properties, keys: [kUSBProductString, kUSBVendorString, "USB Product Name", "USB Vendor Name"]) ?? registryEntryName(current)
+
+                if shouldReleaseCurrent {
+                    IOObjectRelease(current)
+                }
+
+                return stableUSBDeviceID(
+                    vendorID: vendorID,
+                    productID: productID,
+                    serialNumber: serialNumber,
+                    sessionID: sessionID,
+                    locationID: locationID,
+                    name: fallbackName
+                )
+            }
+
+            var parent: io_registry_entry_t = 0
+            guard IORegistryEntryGetParentEntry(current, kIOServicePlane, &parent) == KERN_SUCCESS else {
+                if shouldReleaseCurrent {
+                    IOObjectRelease(current)
+                }
+                return nil
+            }
+
+            if shouldReleaseCurrent {
+                IOObjectRelease(current)
+            }
+
+            current = parent
+            shouldReleaseCurrent = true
+        }
+    }
+
+    private func registryProperties(for service: io_registry_entry_t) -> [String: Any]? {
+        var properties: Unmanaged<CFMutableDictionary>?
+        guard IORegistryEntryCreateCFProperties(service, &properties, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+              let props = properties?.takeRetainedValue() as? [String: Any] else {
+            return nil
+        }
+        return props
     }
 
     private func createUSBDevice(from service: io_service_t) -> USBDevice? {
@@ -616,29 +2388,37 @@ class USBManager: ObservableObject {
         guard IORegistryEntryCreateCFProperties(service, &properties, kCFAllocatorDefault, 0) == KERN_SUCCESS,
               let props = properties?.takeRetainedValue() as? [String: Any] else { return nil }
 
-        let vendorID = props[kUSBVendorID] as? Int ?? 0
-        let productID = props[kUSBProductID] as? Int ?? 0
-        let vendorName = props[kUSBVendorString] as? String ?? props["USB Vendor Name"] as? String ?? ""
-        let productName = props[kUSBProductString] as? String ?? props["USB Product Name"] as? String ?? ""
-        let serialNumber = props[kUSBSerialNumberString] as? String ?? ""
-        let speedRaw = props[kUSBDeviceSpeed] as? Int ?? props["speed"] as? Int ?? -1
-        let deviceClass = props[kUSBDeviceClass] as? Int ?? 0
-        let deviceSubClass = props[kUSBDeviceSubClass] as? Int ?? 0
-        let deviceProtocol = props[kUSBDeviceProtocol] as? Int ?? 0
-        let maxPower = props["Device Current"] as? Int ?? props[kUSBMaxPower] as? Int ?? props["bMaxPower"] as? Int ?? 0
-        let bcdUSB = props["bcdUSB"] as? Int ?? 0
-        let bcdDevice = props["bcdDevice"] as? Int ?? 0
-        let locationID = (props[kUSBDevicePropertyLocationID] as? NSNumber)?.uint32Value ?? 0
+        let vendorID = firstInt(in: props, keys: [kUSBVendorID]) ?? 0
+        let productID = firstInt(in: props, keys: [kUSBProductID]) ?? 0
+        let vendorName = firstString(in: props, keys: [kUSBVendorString, "USB Vendor Name", "kUSBVendorString"]) ?? ""
+        let productName = firstString(in: props, keys: [kUSBProductString, "USB Product Name", "kUSBProductString"]) ?? ""
+        let serialNumber = firstString(in: props, keys: [kUSBSerialNumberString, "kUSBSerialNumberString"]) ?? ""
+        let deviceSpeed = firstInt(in: props, keys: [kUSBDeviceSpeed, "Device Speed", "speed"])
+        let usbSpeed = firstInt(in: props, keys: ["USBSpeed"])
+        let linkSpeedBitsPerSecond = Int64(firstInt(in: props, keys: ["UsbLinkSpeed"]) ?? 0)
+        let deviceClass = firstInt(in: props, keys: [kUSBDeviceClass]) ?? 0
+        let deviceSubClass = firstInt(in: props, keys: [kUSBDeviceSubClass]) ?? 0
+        let deviceProtocol = firstInt(in: props, keys: [kUSBDeviceProtocol]) ?? 0
+        let bcdUSB = firstInt(in: props, keys: ["bcdUSB"]) ?? 0
+        let descriptorMaxPower = normalizedDescriptorPowerMilliamps(rawValue: firstInt(in: props, keys: [kUSBMaxPower, "bMaxPower"]) ?? 0, bcdUSB: bcdUSB)
+        let deviceCurrent = firstInt(in: props, keys: ["Device Current"]) ?? 0
+        let sinkAllocation = firstInt(in: props, keys: ["UsbPowerSinkAllocation"]) ?? 0
+        let maxPower = sinkAllocation > 0 ? sinkAllocation : (deviceCurrent > 0 ? deviceCurrent : descriptorMaxPower)
+        let bcdDevice = firstInt(in: props, keys: ["bcdDevice"]) ?? 0
+        let locationID = firstUInt32(in: props, keys: [kUSBDevicePropertyLocationID]) ?? 0
 
         // Extended properties
-        let currentAvailable = props["AAPL,current-available"] as? Int ?? props["Current Available"] as? Int ?? 0
-        let extraCurrent = props["AAPL,current-extra-in-sleep"] as? Int ?? 0
-        let busPower = props["Bus Power Available"] as? Int ?? 0
-        let isCaptive = props["non-removable"] as? Bool ?? props["Captive"] as? Bool ?? false
-        let isInternal = props["internal"] as? Bool ?? props["Built-In"] as? Bool ?? false
-        let sleepCurrent = props["Sleep Current"] as? Int ?? props["AAPL,sleep-current"] as? Int ?? 0
-        let sessionID = (props["sessionID"] as? NSNumber)?.uint64Value ?? 0
-        let portType = props["port-type"] as? String ?? props["Port Type"] as? String ?? "Standard"
+        let currentAvailable = firstInt(in: props, keys: ["AAPL,current-available", "Current Available"]) ?? 0
+        let extraCurrent = firstInt(in: props, keys: ["AAPL,current-extra-in-sleep"]) ?? 0
+        let busPower = firstInt(in: props, keys: ["Bus Power Available"]) ?? 0
+        let isCaptive = firstBool(in: props, keys: ["non-removable", "Captive"]) ?? false
+        let isInternal = firstBool(in: props, keys: ["internal", "Built-In"]) ?? false
+        let sleepCurrent = firstInt(in: props, keys: ["Sleep Current", "AAPL,sleep-current"]) ?? 0
+        let sessionID = firstUInt64(in: props, keys: ["sessionID"]) ?? 0
+        let currentConfiguration = firstInt(in: props, keys: ["kUSBCurrentConfiguration"]) ?? 0
+        let portType = firstString(in: props, keys: ["port-type", "Port Type", "USBPortType"]) ?? "Standard"
+        let interfaces = scanUSBInterfaces(for: service)
+        let speed = USBSpeed.resolve(deviceSpeed: deviceSpeed, usbSpeed: usbSpeed, linkSpeedBitsPerSecond: linkSpeedBitsPerSecond)
 
         // Determine device name
         var name = productName.isEmpty ? vendorName : productName
@@ -660,7 +2440,7 @@ class USBManager: ObservableObject {
             let patch = bcdUSB & 0x0F
             usbVersion = "\(major).\(minor)\(patch > 0 ? ".\(patch)" : "")"
         } else {
-            usbVersion = USBSpeed(rawValue: speedRaw)?.usbVersionString ?? "Unknown"
+            usbVersion = speed.usbVersionString
         }
 
         // Try to determine parent controller
@@ -675,34 +2455,36 @@ class USBManager: ObservableObject {
         }
 
         // Raw properties for debugging/advanced view
-        let rawProps = props.compactMapValues { value -> String? in
-            if let str = value as? String { return str }
-            if let num = value as? NSNumber { return num.stringValue }
-            if let data = value as? Data, data.count < 100 {
-                return data.map { String(format: "%02X", $0) }.joined(separator: " ")
-            }
-            if let arr = value as? [Any] {
-                return arr.map { "\($0)" }.joined(separator: ", ")
-            }
-            return String(describing: value)
-        }
+        let rawProps = rawPropertyStrings(from: props)
 
-        let isHub = deviceClass == 9
-        let portCount = props["Ports"] as? Int ?? props["PortCount"] as? Int ?? 0
+        let effectiveClass = deviceClass == 0 ? Set(interfaces.map { $0.interfaceClass }.filter { $0 != 0 }).first ?? 0 : deviceClass
+        let isHub = effectiveClass == 9
+        let portCount = firstInt(in: props, keys: ["Ports", "PortCount"]) ?? 0
+        let stableID = stableUSBDeviceID(
+            vendorID: vendorID,
+            productID: productID,
+            serialNumber: serialNumber,
+            sessionID: sessionID,
+            locationID: locationID,
+            name: name
+        )
 
         return USBDevice(
+            id: stableID,
             name: name,
             vendorID: vendorID,
             productID: productID,
             vendorName: vendorName,
             productName: productName,
             serialNumber: serialNumber,
-            speed: USBSpeed(rawValue: speedRaw) ?? .unknown,
+            speed: speed,
             deviceClass: deviceClass,
             deviceSubClass: deviceSubClass,
             deviceProtocol: deviceProtocol,
             maxPower: maxPower,
+            descriptorMaxPowerMilliamps: descriptorMaxPower,
             usbVersion: usbVersion,
+            bcdUSB: bcdUSB,
             locationID: locationID,
             isHub: isHub,
             portCount: portCount,
@@ -714,9 +2496,63 @@ class USBManager: ObservableObject {
             isInternal: isInternal,
             sleepCurrent: sleepCurrent,
             sessionID: sessionID,
+            currentConfiguration: currentConfiguration,
+            linkSpeedBitsPerSecond: linkSpeedBitsPerSecond,
             portType: portType,
             parentControllerName: parentName,
+            interfaces: interfaces,
             rawProperties: rawProps
+        )
+    }
+
+    private func scanUSBInterfaces(for service: io_service_t) -> [USBInterfaceInfo] {
+        var interfaces: [USBInterfaceInfo] = []
+        var iterator: io_iterator_t = 0
+
+        guard IORegistryEntryGetChildIterator(service, kIOServicePlane, &iterator) == KERN_SUCCESS else {
+            return interfaces
+        }
+        defer { IOObjectRelease(iterator) }
+
+        while case let child = IOIteratorNext(iterator), child != 0 {
+            defer { IOObjectRelease(child) }
+            if let interface = createUSBInterface(from: child) {
+                interfaces.append(interface)
+            }
+        }
+
+        return interfaces.sorted {
+            if $0.interfaceNumber == $1.interfaceNumber {
+                return $0.alternateSetting < $1.alternateSetting
+            }
+            return $0.interfaceNumber < $1.interfaceNumber
+        }
+    }
+
+    private func createUSBInterface(from service: io_service_t) -> USBInterfaceInfo? {
+        var properties: Unmanaged<CFMutableDictionary>?
+        guard IORegistryEntryCreateCFProperties(service, &properties, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+              let props = properties?.takeRetainedValue() as? [String: Any],
+              let interfaceClass = firstInt(in: props, keys: ["bInterfaceClass"]) else {
+            return nil
+        }
+
+        let speed = USBSpeed.resolve(
+            deviceSpeed: nil,
+            usbSpeed: firstInt(in: props, keys: ["USBSpeed"]),
+            linkSpeedBitsPerSecond: 0
+        )
+
+        return USBInterfaceInfo(
+            interfaceNumber: firstInt(in: props, keys: ["bInterfaceNumber"]) ?? 0,
+            alternateSetting: firstInt(in: props, keys: ["bAlternateSetting"]) ?? 0,
+            interfaceClass: interfaceClass,
+            interfaceSubClass: firstInt(in: props, keys: ["bInterfaceSubClass"]) ?? 0,
+            interfaceProtocol: firstInt(in: props, keys: ["bInterfaceProtocol"]) ?? 0,
+            endpointCount: firstInt(in: props, keys: ["bNumEndpoints"]) ?? 0,
+            exclusiveOwner: firstString(in: props, keys: ["UsbExclusiveOwner"]) ?? "",
+            speed: speed,
+            rawProperties: rawPropertyStrings(from: props)
         )
     }
 }
@@ -739,15 +2575,105 @@ enum ViewMode: String, CaseIterable {
         }
     }
 }
+
+struct USBHierarchyNode: Identifiable, Hashable {
+    let device: USBDevice
+    let children: [USBHierarchyNode]?
+
+    var id: String { device.id }
+}
+
+struct USBHierarchySection: Identifiable, Hashable {
+    let controllerName: String
+    let controller: USBController?
+    let roots: [USBHierarchyNode]
+    let visibleDeviceCount: Int
+
+    var id: String {
+        controller?.id ?? controllerName
+    }
+}
+
+private func usbPathIsPrefix(_ prefix: [Int], of candidate: [Int]) -> Bool {
+    guard prefix.count <= candidate.count else { return false }
+    return zip(prefix, candidate).allSatisfy(==)
+}
+
+private func usbHierarchySort(_ lhs: USBDevice, _ rhs: USBDevice) -> Bool {
+    if lhs.portPathComponents != rhs.portPathComponents {
+        return lhs.portPathComponents.lexicographicallyPrecedes(rhs.portPathComponents)
+    }
+
+    if lhs.name.localizedCaseInsensitiveCompare(rhs.name) != .orderedSame {
+        return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+    }
+
+    return lhs.hierarchyIdentityLine.localizedCaseInsensitiveCompare(rhs.hierarchyIdentityLine) == .orderedAscending
+}
+
+private func usbDirectParent(of candidate: USBDevice, within devices: [USBDevice]) -> USBDevice? {
+    guard !candidate.portPathComponents.isEmpty else { return nil }
+
+    return devices
+        .filter {
+            $0.id != candidate.id &&
+            $0.controllerGroupName == candidate.controllerGroupName &&
+            $0.isHub &&
+            !$0.portPathComponents.isEmpty &&
+            $0.portPathComponents.count < candidate.portPathComponents.count &&
+            usbPathIsPrefix($0.portPathComponents, of: candidate.portPathComponents)
+        }
+        .max { lhs, rhs in
+            lhs.portPathComponents.count < rhs.portPathComponents.count
+        }
+}
+
+private func buildUSBHierarchyTree(from devices: [USBDevice]) -> [USBHierarchyNode] {
+    let sortedDevices = devices.sorted(by: usbHierarchySort)
+
+    func children(for parent: USBDevice?) -> [USBHierarchyNode] {
+        let matchingDevices = sortedDevices.filter { candidate in
+            let directParent = usbDirectParent(of: candidate, within: sortedDevices)
+            if let parent {
+                return directParent?.id == parent.id
+            }
+            return directParent == nil
+        }
+
+        return matchingDevices.map { device in
+            let nestedChildren = children(for: device)
+            return USBHierarchyNode(device: device, children: nestedChildren.isEmpty ? nil : nestedChildren)
+        }
+    }
+
+    return children(for: nil)
+}
+
+private func buildUSBHierarchySections(devices: [USBDevice], controllers: [USBController]) -> [USBHierarchySection] {
+    let groupedDevices = Dictionary(grouping: devices, by: \.controllerGroupName)
+
+    return groupedDevices.keys.sorted().compactMap { controllerName in
+        let controllerDevices = groupedDevices[controllerName] ?? []
+        let roots = buildUSBHierarchyTree(from: controllerDevices)
+        guard !roots.isEmpty else { return nil }
+
+        return USBHierarchySection(
+            controllerName: controllerName,
+            controller: controllers.first { $0.name == controllerName },
+            roots: roots,
+            visibleDeviceCount: controllerDevices.count
+        )
+    }
+}
 #endif
 
 // MARK: - Content View
 #if os(macOS)
 struct ContentView: View {
     @StateObject private var usbManager = USBManager()
-    @State private var selectedDevice: USBDevice?
-    @State private var selectedController: USBController?
-    @State private var selectedThunderbolt: ThunderboltDevice?
+    @State private var selectedDeviceID: USBDevice.ID?
+    @State private var selectedControllerID: USBController.ID?
+    @State private var selectedThunderboltID: ThunderboltDevice.ID?
     @State private var searchText = ""
     @State private var viewMode: ViewMode = .devices
     @State private var showRawProperties = false
@@ -758,10 +2684,57 @@ struct ContentView: View {
             $0.name.localizedCaseInsensitiveContains(searchText) ||
             $0.vendorName.localizedCaseInsensitiveContains(searchText) ||
             $0.productName.localizedCaseInsensitiveContains(searchText) ||
+            $0.classInfo.name.localizedCaseInsensitiveContains(searchText) ||
+            $0.classSource.localizedCaseInsensitiveContains(searchText) ||
             $0.vendorIDHex.localizedCaseInsensitiveContains(searchText) ||
             $0.productIDHex.localizedCaseInsensitiveContains(searchText) ||
-            $0.serialNumber.localizedCaseInsensitiveContains(searchText)
+            $0.serialNumber.localizedCaseInsensitiveContains(searchText) ||
+            $0.translationSearchText.localizedCaseInsensitiveContains(searchText) ||
+            $0.interfaces.contains {
+                $0.classInfo.name.localizedCaseInsensitiveContains(searchText) ||
+                $0.meaning.technicalLabel.localizedCaseInsensitiveContains(searchText) ||
+                $0.meaning.plainEnglish.localizedCaseInsensitiveContains(searchText) ||
+                $0.exclusiveOwner.localizedCaseInsensitiveContains(searchText)
+            }
         }
+    }
+
+    var hierarchyDevices: [USBDevice] {
+        guard !searchText.isEmpty else { return usbManager.devices }
+
+        var includedIDs = Set(filteredDevices.map(\.id))
+        guard !includedIDs.isEmpty else { return [] }
+
+        var madeProgress = true
+        while madeProgress {
+            madeProgress = false
+            for device in usbManager.devices where includedIDs.contains(device.id) {
+                if let parent = usbDirectParent(of: device, within: usbManager.devices), includedIDs.insert(parent.id).inserted {
+                    madeProgress = true
+                }
+            }
+        }
+
+        return usbManager.devices.filter { includedIDs.contains($0.id) }
+    }
+
+    var deviceHierarchySections: [USBHierarchySection] {
+        buildUSBHierarchySections(devices: hierarchyDevices, controllers: usbManager.controllers)
+    }
+
+    var selectedDevice: USBDevice? {
+        guard let selectedDeviceID else { return nil }
+        return usbManager.devices.first { $0.id == selectedDeviceID }
+    }
+
+    var selectedController: USBController? {
+        guard let selectedControllerID else { return nil }
+        return usbManager.controllers.first { $0.id == selectedControllerID }
+    }
+
+    var selectedThunderbolt: ThunderboltDevice? {
+        guard let selectedThunderboltID else { return nil }
+        return usbManager.thunderboltDevices.first { $0.id == selectedThunderboltID }
     }
 
     var body: some View {
@@ -814,6 +2787,21 @@ struct ContentView: View {
         }
         .searchable(text: $searchText, prompt: "Search...")
         .navigationTitle("USB Inspector Pro")
+        .onChange(of: usbManager.devices) { _, devices in
+            if let selectedDeviceID, !devices.contains(where: { $0.id == selectedDeviceID }) {
+                self.selectedDeviceID = nil
+            }
+        }
+        .onChange(of: usbManager.controllers) { _, controllers in
+            if let selectedControllerID, !controllers.contains(where: { $0.id == selectedControllerID }) {
+                self.selectedControllerID = nil
+            }
+        }
+        .onChange(of: usbManager.thunderboltDevices) { _, thunderboltDevices in
+            if let selectedThunderboltID, !thunderboltDevices.contains(where: { $0.id == selectedThunderboltID }) {
+                self.selectedThunderboltID = nil
+            }
+        }
         .toolbar {
             ToolbarItem(placement: .automatic) {
                 Button(action: { showRawProperties.toggle() }) {
@@ -832,18 +2820,36 @@ struct ContentView: View {
 
     // MARK: - Device List
     var deviceListView: some View {
-        List(filteredDevices, selection: $selectedDevice) { device in
-            DeviceRow(device: device)
-                .tag(device)
+        Group {
+            if deviceHierarchySections.isEmpty {
+                ContentUnavailableView {
+                    Label(searchText.isEmpty ? "No USB Devices" : "No Matching Devices", systemImage: searchText.isEmpty ? "cable.connector" : "magnifyingglass")
+                } description: {
+                    Text(searchText.isEmpty ? "Connect a USB device or refresh the scan to populate the hierarchy." : "Try a broader search term or clear the search to see the full controller and hub tree.")
+                }
+            } else {
+                List(selection: $selectedDeviceID) {
+                    ForEach(deviceHierarchySections) { section in
+                        Section {
+                            OutlineGroup(section.roots, children: \.children) { node in
+                                DeviceRow(device: node.device)
+                                    .tag(node.device.id)
+                            }
+                        } header: {
+                            DeviceHierarchySectionHeader(section: section)
+                        }
+                    }
+                }
+                .listStyle(.sidebar)
+            }
         }
-        .listStyle(.inset)
     }
 
     // MARK: - Controller List
     var controllerListView: some View {
-        List(usbManager.controllers, selection: $selectedController) { controller in
+        List(usbManager.controllers, selection: $selectedControllerID) { controller in
             ControllerRow(controller: controller)
-                .tag(controller)
+                .tag(controller.id)
         }
         .listStyle(.inset)
     }
@@ -858,9 +2864,9 @@ struct ContentView: View {
                     Text("No Thunderbolt ports or devices detected. Thunderbolt ports look like USB-C but have a ⚡ lightning bolt symbol next to them.")
                 }
             } else {
-                List(usbManager.thunderboltDevices, selection: $selectedThunderbolt) { device in
+                List(usbManager.thunderboltDevices, selection: $selectedThunderboltID) { device in
                     ThunderboltRow(device: device)
-                        .tag(device)
+                        .tag(device.id)
                 }
                 .listStyle(.inset)
             }
@@ -912,7 +2918,7 @@ struct ContentView: View {
         switch viewMode {
         case .devices:
             if let device = selectedDevice {
-                DeviceDetailView(device: device, showRaw: showRawProperties)
+                DeviceDetailView(device: device, allDevices: usbManager.devices, showRaw: showRawProperties, onRefresh: usbManager.refreshAll)
             } else {
                 ContentUnavailableView {
                     Label("Select a Device", systemImage: "cable.connector")
@@ -922,7 +2928,7 @@ struct ContentView: View {
             }
         case .controllers:
             if let controller = selectedController {
-                ControllerDetailView(controller: controller, showRaw: showRawProperties)
+                ControllerDetailView(controller: controller, devices: usbManager.devices, showRaw: showRawProperties)
             } else {
                 ContentUnavailableView {
                     Label("Select a Controller", systemImage: "cpu")
@@ -982,8 +2988,20 @@ struct DeviceRow: View {
                     .font(.headline)
                     .lineLimit(1)
 
+                if !device.rowSubtitle.isEmpty {
+                    Text(device.rowSubtitle)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+
+                Text(device.hierarchyIdentityLine)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+
                 HStack(spacing: 6) {
-                    Text(device.speed.shortDescription)
+                    Text(device.negotiatedSpeedDescription)
                         .font(.caption2)
                         .fontWeight(.medium)
                         .padding(.horizontal, 6)
@@ -991,12 +3009,18 @@ struct DeviceRow: View {
                         .background(device.speed.color.opacity(0.2))
                         .cornerRadius(4)
 
-                    Text(device.classInfo.name)
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
+                    if device.isPerformanceLimited {
+                        Text("Below spec")
+                            .font(.caption2)
+                            .foregroundColor(.orange)
+                    }
 
                     if device.isInternal {
                         Image(systemName: "internaldrive")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    } else if device.isCompositeDevice {
+                        Image(systemName: "square.stack.3d.up")
                             .font(.caption2)
                             .foregroundColor(.secondary)
                     }
@@ -1011,6 +3035,120 @@ struct DeviceRow: View {
                 .frame(width: 8, height: 8)
         }
         .padding(.vertical, 4)
+    }
+}
+
+struct DeviceHierarchySectionHeader: View {
+    let section: USBHierarchySection
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Image(systemName: "cpu")
+                    .foregroundColor(.blue)
+                Text(section.controllerName)
+                    .fontWeight(.semibold)
+                Spacer()
+                Text("\(section.visibleDeviceCount)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            if let controller = section.controller {
+                Text(controller.controllerType)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            } else {
+                Text("Controller or host path grouping")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .textCase(nil)
+    }
+}
+
+struct USBHierarchyBranchView: View {
+    let node: USBHierarchyNode
+    var showVolumes: Bool = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: node.device.classInfo.icon)
+                    .foregroundColor(node.device.speed.color)
+                    .frame(width: 18)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(node.device.name)
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+
+                    if !node.device.rowSubtitle.isEmpty {
+                        Text(node.device.rowSubtitle)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    Text(node.device.hierarchyIdentityLine)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+
+                    if let children = node.children, !children.isEmpty {
+                        Text(children.count == 1 ? "1 downstream child" : "\(children.count) downstream children")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                Spacer()
+
+                Text(node.device.negotiatedSpeedDescription)
+                    .font(.caption2)
+                    .fontWeight(.medium)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(node.device.speed.color.opacity(0.18))
+                    .cornerRadius(5)
+            }
+
+            if showVolumes && !node.device.mountedVolumes.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(node.device.mountedVolumes) { volume in
+                        HStack(spacing: 8) {
+                            Image(systemName: "internaldrive")
+                                .font(.caption)
+                                .foregroundColor(.green)
+                                .frame(width: 14)
+                            Text(volume.displayName)
+                                .font(.caption)
+                            Spacer()
+                            Text(volume.bsdName)
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+                .padding(.leading, 28)
+            }
+
+            if let children = node.children, !children.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(children) { child in
+                        USBHierarchyBranchView(node: child, showVolumes: showVolumes)
+                    }
+                }
+                .padding(.leading, 18)
+                .overlay(alignment: .leading) {
+                    Rectangle()
+                        .fill(Color.secondary.opacity(0.18))
+                        .frame(width: 1)
+                }
+            }
+        }
+        .padding(12)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .cornerRadius(10)
     }
 }
 
@@ -1090,8 +3228,107 @@ struct ThunderboltRow: View {
 // MARK: - Device Detail View
 struct DeviceDetailView: View {
     let device: USBDevice
+    let allDevices: [USBDevice]
     let showRaw: Bool
-    @State private var expandedSections: Set<String> = ["speed", "device", "power", "quality"]
+    let onRefresh: () -> Void
+    @State private var expandedSections: Set<String> = ["translation", "speed", "device", "volumes", "interfaces", "power", "quality"]
+    @State private var volumeActionStatus: String?
+
+    private func isPrefixPath(_ prefix: [Int], of candidate: [Int]) -> Bool {
+        guard prefix.count <= candidate.count else { return false }
+        return zip(prefix, candidate).allSatisfy(==)
+    }
+
+    private func directParent(for candidate: USBDevice) -> USBDevice? {
+        guard !candidate.portPathComponents.isEmpty else { return nil }
+
+        return allDevices
+            .filter {
+                $0.id != candidate.id &&
+                $0.controllerGroupName == candidate.controllerGroupName &&
+                $0.isHub &&
+                !$0.portPathComponents.isEmpty &&
+                $0.portPathComponents.count < candidate.portPathComponents.count &&
+                isPrefixPath($0.portPathComponents, of: candidate.portPathComponents)
+            }
+            .max { lhs, rhs in
+                lhs.portPathComponents.count < rhs.portPathComponents.count
+            }
+    }
+
+    private var upstreamChain: [USBDevice] {
+        var chain: [USBDevice] = []
+        var current = directParent(for: device)
+
+        while let node = current {
+            chain.append(node)
+            current = directParent(for: node)
+        }
+
+        return chain.reversed()
+    }
+
+    private var downstreamChildren: [USBDevice] {
+        guard device.isHub else { return [] }
+        return allDevices
+            .filter { directParent(for: $0)?.id == device.id }
+            .sorted {
+                if $0.portPathComponents != $1.portPathComponents {
+                    return $0.portPathComponents.lexicographicallyPrecedes($1.portPathComponents)
+                }
+                return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+            }
+    }
+
+    private func revealInFinder(_ volume: StorageVolumeInfo) {
+        guard volume.isMounted else { return }
+        _ = NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: volume.mountPath)
+        volumeActionStatus = "Opened \(volume.displayName) in Finder."
+    }
+
+    private func openVolume(_ volume: StorageVolumeInfo) {
+        guard volume.isMounted else { return }
+        let url = URL(fileURLWithPath: volume.mountPath)
+        if NSWorkspace.shared.open(url) {
+            volumeActionStatus = "Opened \(volume.displayName)."
+        } else {
+            volumeActionStatus = "macOS couldn't open \(volume.displayName)."
+        }
+    }
+
+    private func copyMountPath(_ volume: StorageVolumeInfo) {
+        guard volume.isMounted else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(volume.mountPath, forType: .string)
+        volumeActionStatus = "Copied mount path for \(volume.displayName)."
+    }
+
+    private func ejectVolume(_ volume: StorageVolumeInfo) {
+        guard volume.isMounted else { return }
+        let success = NSWorkspace.shared.unmountAndEjectDevice(atPath: volume.mountPath)
+        volumeActionStatus = success
+            ? "Requested eject for \(volume.displayName)."
+            : "macOS couldn't eject \(volume.displayName)."
+
+        if success {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                onRefresh()
+            }
+        }
+    }
+
+    private func binding(for section: String) -> Binding<Bool> {
+        Binding(
+            get: { expandedSections.contains(section) },
+            set: { isExpanded in
+                if isExpanded {
+                    expandedSections.insert(section)
+                } else {
+                    expandedSections.remove(section)
+                }
+            }
+        )
+    }
 
     var body: some View {
         ScrollView {
@@ -1101,37 +3338,53 @@ struct DeviceDetailView: View {
 
                 Divider()
 
+                CollapsibleSection(title: "🧠 Translation Layer", icon: "lightbulb", isExpanded: binding(for: "translation")) {
+                    translationSection
+                }
+
                 // Connection Quality Card
                 qualityCard
 
                 // Speed Section
-                CollapsibleSection(title: "⚡ How Fast Is It?", icon: device.speed.icon, isExpanded: expandedSections.contains("speed")) {
+                CollapsibleSection(title: "⚡ How Fast Is It?", icon: device.speed.icon, isExpanded: binding(for: "speed")) {
                     SpeedDetailView(device: device)
                 }
 
                 // Device Info Section
-                CollapsibleSection(title: "📋 Device Details", icon: "info.circle", isExpanded: expandedSections.contains("device")) {
+                CollapsibleSection(title: "📋 Device Details", icon: "info.circle", isExpanded: binding(for: "device")) {
                     deviceInfoSection
                 }
 
+                if !device.storageVolumes.isEmpty {
+                    CollapsibleSection(title: "🗂 Finder & Disk Mapping", icon: "externaldrive", isExpanded: binding(for: "volumes")) {
+                        volumeSection
+                    }
+                }
+
+                if !device.interfaces.isEmpty {
+                    CollapsibleSection(title: "🧩 Interface Breakdown", icon: "square.stack.3d.up", isExpanded: binding(for: "interfaces")) {
+                        interfaceSection
+                    }
+                }
+
                 // Technical Details
-                CollapsibleSection(title: "🔧 Developer Info", icon: "gearshape.2", isExpanded: expandedSections.contains("technical")) {
+                CollapsibleSection(title: "🔧 Developer Info", icon: "gearshape.2", isExpanded: binding(for: "technical")) {
                     technicalSection
                 }
 
                 // Power Section
-                CollapsibleSection(title: "🔋 Power Usage", icon: "bolt.fill", isExpanded: expandedSections.contains("power")) {
+                CollapsibleSection(title: "🔋 Power Usage", icon: "bolt.fill", isExpanded: binding(for: "power")) {
                     powerSection
                 }
 
                 // Topology Section
-                CollapsibleSection(title: "🔌 Connection Path", icon: "point.3.connected.trianglepath.dotted", isExpanded: expandedSections.contains("topology")) {
+                CollapsibleSection(title: "🔌 Connection Path", icon: "point.3.connected.trianglepath.dotted", isExpanded: binding(for: "topology")) {
                     topologySection
                 }
 
                 // Raw Properties
                 if showRaw {
-                    CollapsibleSection(title: "📄 Raw System Data", icon: "doc.text", isExpanded: expandedSections.contains("raw")) {
+                    CollapsibleSection(title: "📄 Raw System Data", icon: "doc.text", isExpanded: binding(for: "raw")) {
                         rawPropertiesSection
                     }
                 }
@@ -1160,28 +3413,122 @@ struct DeviceDetailView: View {
                     .fontWeight(.bold)
 
                 HStack(spacing: 8) {
-                    if !device.vendorName.isEmpty {
-                        Text(device.vendorName)
+                    if !device.vendorDisplayName.isEmpty {
+                        Text(device.vendorDisplayName)
                             .font(.subheadline)
                             .foregroundColor(.secondary)
-                    }
 
-                    Text("•")
-                        .foregroundColor(.secondary)
+                        Text("•")
+                            .foregroundColor(.secondary)
+                    }
 
                     Text(device.classInfo.name)
                         .font(.subheadline)
                         .foregroundColor(.secondary)
+
+                    Text(device.negotiatedSpeedDescription)
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(device.speed.color.opacity(0.15))
+                        .cornerRadius(6)
                 }
+
+                Text(device.translationHeadline)
+                    .font(.subheadline)
+                    .fontWeight(.medium)
 
                 // Layman-friendly explanation
                 Text(device.classInfo.layman)
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .italic()
+
+                Text(device.classSource)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
             }
 
             Spacer()
+        }
+    }
+
+    var translationSection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(device.translationHeadline)
+                .font(.title3)
+                .fontWeight(.semibold)
+
+            if !device.translationBadges.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(Array(device.translationBadges.prefix(6)), id: \.self) { badge in
+                            MetadataPill(text: badge, accent: device.speed.color)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+
+            Text(device.translationSummary)
+                .font(.callout)
+
+            if let vendorContext = device.vendorContext {
+                Divider()
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Vendor Context")
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.secondary)
+
+                    Text(vendorContext)
+                        .font(.callout)
+                }
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("What This Means on Your Mac")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundColor(.secondary)
+
+                ForEach(Array(device.userFacingBehaviors.prefix(4)), id: \.self) { behavior in
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.caption)
+                            .foregroundColor(device.speed.color)
+                            .padding(.top, 3)
+                        Text(behavior)
+                            .font(.callout)
+                    }
+                }
+            }
+
+            if !device.translatedHighlights.isEmpty {
+                Divider()
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("What Makes This One Interesting")
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.secondary)
+
+                    ForEach(Array(device.translatedHighlights.prefix(4)), id: \.self) { highlight in
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "circle.fill")
+                                .font(.system(size: 5))
+                                .foregroundColor(.secondary)
+                                .padding(.top, 7)
+                            Text(highlight)
+                                .font(.callout)
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1245,8 +3592,193 @@ struct DeviceDetailView: View {
             DetailRowWithHelp(label: "Serial Number", value: device.serialNumber.isEmpty ? "None" : device.serialNumber, help: "A unique ID for this specific device – useful for tracking or warranty")
             DetailRowWithHelp(label: "Device Version", value: device.bcdDeviceString, help: "The hardware/firmware version of this device")
             DetailRowWithHelp(label: "USB Version", value: device.usbVersion, help: "Which USB standard this device was built for")
+            DetailRowWithHelp(label: "Negotiated Link", value: device.negotiatedSpeedDescription, help: "The actual link speed macOS reports for this connection")
+            DetailRowWithHelp(label: "Classification", value: device.classSource, help: "Whether the device type came from the device descriptor or from interface descriptors")
+            if !device.storageVolumes.isEmpty {
+                DetailRowWithHelp(label: "Finder Volumes", value: device.volumeSummary, help: "Which mounted disks or disk objects macOS currently maps back to this physical USB device")
+            }
+            if device.currentConfiguration > 0 {
+                DetailRowWithHelp(label: "Configuration", value: "\(device.currentConfiguration)", help: "The active USB configuration selected by macOS")
+            }
             if device.isHub {
                 DetailRowWithHelp(label: "Available Ports", value: "\(device.portCount) ports", help: "How many devices you can plug into this hub")
+            }
+        }
+    }
+
+    var volumeSection: some View {
+        let groupedVolumes = Dictionary(grouping: device.sortedStorageVolumes, by: \.wholeDiskBSDName)
+        let sortedWholeDisks = groupedVolumes.keys.sorted()
+
+        return VStack(alignment: .leading, spacing: 12) {
+            Text("This maps Finder-visible disks and volumes back to the physical USB device, so you can see what storage objects fall under this hardware.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            if let volumeActionStatus {
+                Text(volumeActionStatus)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            ForEach(sortedWholeDisks, id: \.self) { wholeDiskBSDName in
+                let group = groupedVolumes[wholeDiskBSDName] ?? []
+                let wholeDisk = group.first(where: \.isWholeDisk)
+                let children = group.filter { !$0.isWholeDisk }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(alignment: .top) {
+                        Image(systemName: "externaldrive")
+                            .foregroundColor(device.speed.color)
+                            .frame(width: 18)
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(wholeDisk?.displayName ?? wholeDiskBSDName)
+                                .font(.subheadline)
+                                .fontWeight(.semibold)
+                            Text(wholeDisk?.subtitle ?? wholeDiskBSDName)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+
+                        Spacer()
+
+                        Text(wholeDiskBSDName)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    if let wholeDisk {
+                        let transportDetails = orderedUniqueStrings([wholeDisk.deviceProtocol, wholeDisk.deviceModel]).joined(separator: " • ")
+                        if !transportDetails.isEmpty {
+                            Text(transportDetails)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+
+                    if children.isEmpty {
+                        Text("No mounted Finder volumes are currently hanging off this disk object.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    } else {
+                        ForEach(children) { volume in
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Image(systemName: volume.isMounted ? "internaldrive.fill" : "internaldrive")
+                                        .font(.caption)
+                                        .foregroundColor(volume.isMounted ? .green : .secondary)
+                                    Text(volume.displayName)
+                                        .font(.callout)
+                                    Spacer()
+                                    Text(volume.bsdName)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+
+                                Text(volume.subtitle)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+
+                                if volume.isMounted {
+                                    Text(volume.mountDescription)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+
+                                    if volume.availableBytes > 0 {
+                                        Text("\(volume.availableDescription) free")
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                    }
+
+                                    HStack(spacing: 8) {
+                                        Button("Open") { openVolume(volume) }
+                                            .buttonStyle(.bordered)
+                                            .controlSize(.small)
+                                        Button("Reveal") { revealInFinder(volume) }
+                                            .buttonStyle(.bordered)
+                                            .controlSize(.small)
+                                        Button("Copy Path") { copyMountPath(volume) }
+                                            .buttonStyle(.bordered)
+                                            .controlSize(.small)
+                                        Button("Eject") { ejectVolume(volume) }
+                                            .buttonStyle(.borderedProminent)
+                                            .controlSize(.small)
+                                            .tint(.orange)
+                                    }
+                                }
+                            }
+                            .padding(.leading, 26)
+                        }
+                    }
+                }
+                .padding(12)
+                .background(Color(nsColor: .controlBackgroundColor))
+                .cornerRadius(10)
+            }
+        }
+    }
+
+    var interfaceSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("macOS exposes composite-device functions as separate IOUSBHostInterface descriptors. This is the most reliable way to understand what a multi-function USB device actually does.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            ForEach(device.interfaces) { interface in
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .top) {
+                        Image(systemName: interface.classInfo.icon)
+                            .foregroundColor(interface.speed.color)
+                            .frame(width: 18)
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(interface.meaning.technicalLabel)
+                                .font(.subheadline)
+                                .fontWeight(.semibold)
+                            Text(interface.summary)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+
+                        Spacer()
+                    }
+
+                    Text(interface.meaning.plainEnglish)
+                        .font(.callout)
+
+                    Text(interface.meaning.macBehavior)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    if !interface.exclusiveOwner.isEmpty {
+                        Text("Claimed by \(interface.exclusiveOwner)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    if let ownerExplanation = interface.ownerExplanation {
+                        Text(ownerExplanation)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    Text(interface.meaning.uniqueness)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    HStack(spacing: 16) {
+                        Text(interface.technicalSignature)
+                        if interface.alternateSetting > 0 {
+                            Text("Alt \(interface.alternateSetting)")
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                }
+                .padding(12)
+                .background(Color(nsColor: .controlBackgroundColor))
+                .cornerRadius(10)
             }
         }
     }
@@ -1259,10 +3791,16 @@ struct DeviceDetailView: View {
 
             DetailRow(label: "Vendor ID", value: device.vendorIDHex)
             DetailRow(label: "Product ID", value: device.productIDHex)
+            DetailRow(label: "Primary Role", value: device.primaryMeaning.technicalLabel)
             DetailRow(label: "Device Class", value: "\(device.deviceClass) (\(device.classInfo.name))")
             DetailRow(label: "SubClass", value: "\(device.deviceSubClass)")
             DetailRow(label: "Protocol", value: "\(device.deviceProtocol)")
+            DetailRow(label: "Interfaces", value: "\(device.interfaces.count)")
+            DetailRow(label: "Negotiated Link", value: device.negotiatedSpeedDescription)
             DetailRow(label: "Port Type", value: device.portType)
+            if device.currentConfiguration > 0 {
+                DetailRow(label: "Configuration", value: "\(device.currentConfiguration)")
+            }
             if device.sessionID > 0 {
                 DetailRow(label: "Session ID", value: String(format: "0x%016llX", device.sessionID))
             }
@@ -1270,22 +3808,24 @@ struct DeviceDetailView: View {
     }
 
     var powerSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let comparisonPower = device.descriptorMaxPowerMilliamps > 0 ? device.descriptorMaxPowerMilliamps : device.maxPower
+
+        return VStack(alignment: .leading, spacing: 10) {
             // Power explanation
-            Text("⚡ How much power does this device use?")
+            Text("⚡ What power budget did macOS negotiate?")
                 .font(.subheadline)
                 .fontWeight(.medium)
 
             // Visual power meter
-            if device.maxPower > 0 {
+            if comparisonPower > 0 {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        Text("Power Usage")
+                        Text("Power Budget")
                             .font(.caption)
                             .foregroundColor(.secondary)
                         Spacer()
                         if device.busPowerAvailable > 0 {
-                            Text(device.maxPower > device.busPowerAvailable ? "⚠️ Needs more power!" : "✅ OK")
+                            Text(comparisonPower > device.busPowerAvailable ? "⚠️ Over budget" : "✅ Within budget")
                                 .font(.caption)
                                 .fontWeight(.medium)
                         }
@@ -1297,8 +3837,8 @@ struct DeviceDetailView: View {
                                 RoundedRectangle(cornerRadius: 6)
                                     .fill(Color.gray.opacity(0.2))
                                 RoundedRectangle(cornerRadius: 6)
-                                    .fill(device.maxPower > device.busPowerAvailable ? Color.red : Color.green)
-                                    .frame(width: geo.size.width * min(CGFloat(device.maxPower) / CGFloat(device.busPowerAvailable), 1.0))
+                                    .fill(comparisonPower > device.busPowerAvailable ? Color.red : Color.green)
+                                    .frame(width: geo.size.width * min(CGFloat(comparisonPower) / CGFloat(device.busPowerAvailable), 1.0))
                             }
                         }
                         .frame(height: 10)
@@ -1307,11 +3847,15 @@ struct DeviceDetailView: View {
                     // Plain English power info
                     let watts = Double(device.maxPower) * 5.0 / 1000.0
                     let wattsString = String(format: "%.1f", watts)
-                    Text("Uses \(device.maxPower) mA (\(wattsString) watts)")
+                    Text("Negotiated budget: \(device.maxPower) mA (\(wattsString) watts)")
                         .font(.callout)
 
+                    Text(device.descriptorPowerDescription)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
                     if device.busPowerAvailable > 0 {
-                        Text("Port provides up to \(device.busPowerAvailable) mA")
+                        Text("Port reports up to \(device.busPowerAvailable) mA available")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
@@ -1322,15 +3866,15 @@ struct DeviceDetailView: View {
 
             // What this means
             VStack(alignment: .leading, spacing: 4) {
-                if device.maxPower > 500 {
+                if comparisonPower > 500 {
                     Label("High-power device – may need a powered hub or direct connection", systemImage: "bolt.fill")
                         .font(.caption)
                         .foregroundColor(.orange)
-                } else if device.maxPower > 100 {
+                } else if comparisonPower > 100 {
                     Label("Normal power usage – works with any USB port", systemImage: "checkmark.circle")
                         .font(.caption)
                         .foregroundColor(.green)
-                } else if device.maxPower > 0 {
+                } else if comparisonPower > 0 {
                     Label("Low power device – very efficient!", systemImage: "leaf.fill")
                         .font(.caption)
                         .foregroundColor(.green)
@@ -1343,7 +3887,12 @@ struct DeviceDetailView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
                 if device.sleepCurrent > 0 {
-                    Text("Uses \\(device.sleepCurrent) mA to stay ready")
+                    Text("Uses \(device.sleepCurrent) mA to stay ready")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                if device.extraCurrentInSleep > 0 {
+                    Text("Can request an extra \(device.extraCurrentInSleep) mA during sleep")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -1360,8 +3909,14 @@ struct DeviceDetailView: View {
             // Plain English connection path
             VStack(alignment: .leading, spacing: 6) {
                 if !device.parentControllerName.isEmpty {
-                    Label("Connected through \\(device.parentControllerName)", systemImage: "arrow.turn.down.right")
+                    Label("Connected through \(device.parentControllerName)", systemImage: "arrow.turn.down.right")
                         .font(.callout)
+                }
+
+                if !device.storageVolumes.isEmpty {
+                    Label("Finder currently maps this hardware to \(device.volumeSummary)", systemImage: "externaldrive.badge.checkmark")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
 
                 HStack(spacing: 16) {
@@ -1379,6 +3934,46 @@ struct DeviceDetailView: View {
                         Label("External / Removable", systemImage: "eject")
                             .font(.caption)
                             .foregroundColor(.green)
+                    }
+                }
+            }
+
+            if !upstreamChain.isEmpty || !downstreamChildren.isEmpty {
+                Divider()
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Topology")
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.secondary)
+
+                    if !upstreamChain.isEmpty {
+                        Text(([device.controllerGroupName] + upstreamChain.map(\.name) + [device.name]).joined(separator: " → "))
+                            .font(.callout)
+                    } else {
+                        Text("\(device.controllerGroupName) → \(device.name)")
+                            .font(.callout)
+                    }
+
+                    if !downstreamChildren.isEmpty {
+                        Text("Downstream from this hub")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+
+                        ForEach(downstreamChildren) { child in
+                            HStack {
+                                Image(systemName: child.classInfo.icon)
+                                    .font(.caption)
+                                    .foregroundColor(child.speed.color)
+                                Text(child.name)
+                                    .font(.caption)
+                                Spacer()
+                                Text(child.locationDescription)
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                            .padding(.leading, 12)
+                        }
                     }
                 }
             }
@@ -1437,7 +4032,7 @@ struct SpeedDetailView: View {
 
                 Spacer()
 
-                Text(device.speed.shortDescription)
+                Text(device.negotiatedSpeedDescription)
                     .font(.title2)
                     .fontWeight(.bold)
                     .foregroundColor(device.speed.color)
@@ -1449,6 +4044,12 @@ struct SpeedDetailView: View {
                 .foregroundColor(.secondary)
                 .italic()
                 .padding(.vertical, 4)
+
+            if device.linkSpeedBitsPerSecond > 0 {
+                Text("macOS reports a negotiated link of \(device.negotiatedSpeedDescription). Compare that with the advertised USB version to spot cable, hub, or port bottlenecks.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
 
             Divider()
 
@@ -1485,6 +4086,16 @@ struct SpeedDetailView: View {
             // Plain English speed info
             VStack(alignment: .leading, spacing: 6) {
                 DetailRowWithHelp(
+                    label: "Negotiated Link",
+                    value: device.negotiatedSpeedDescription,
+                    help: "The actual speed macOS says the connection negotiated at"
+                )
+                DetailRowWithHelp(
+                    label: "Advertised USB Version",
+                    value: device.usbVersion,
+                    help: "What the device descriptor says this hardware was built to support"
+                )
+                DetailRowWithHelp(
                     label: "Max Speed",
                     value: device.theoreticalBandwidth.speed,
                     help: "The fastest this connection can theoretically go"
@@ -1504,23 +4115,27 @@ struct SpeedDetailView: View {
     }
 
     var speedPercentage: CGFloat {
-        // Scale to USB4/TB4 40 Gbps max
-        switch device.speed {
-        case .unknown: return 0.02
-        case .low: return 0.02        // 1.5 Mbps
-        case .full: return 0.03       // 12 Mbps
-        case .high: return 0.12       // 480 Mbps
-        case .super_: return 0.125    // 5 Gbps
-        case .superPlus: return 0.25  // 10 Gbps
-        case .superPlusBy2: return 0.5 // 20 Gbps
-        }
+        let reference = Double(device.linkSpeedBitsPerSecond > 0 ? device.linkSpeedBitsPerSecond : (device.speed.nominalBitsPerSecond ?? 0))
+        guard reference > 0 else { return 0.02 }
+        return CGFloat(min(max(reference / 40_000_000_000, 0.02), 1.0))
     }
 }
 
 // MARK: - Controller Detail View
 struct ControllerDetailView: View {
     let controller: USBController
+    let devices: [USBDevice]
     let showRaw: Bool
+
+    var attachedDevices: [USBDevice] {
+        devices
+            .filter { $0.controllerGroupName == controller.name }
+            .sorted(by: usbHierarchySort)
+    }
+
+    var attachedHierarchy: [USBHierarchyNode] {
+        buildUSBHierarchyTree(from: attachedDevices)
+    }
 
     var body: some View {
         ScrollView {
@@ -1582,6 +4197,20 @@ struct ControllerDetailView: View {
                         .foregroundColor(.secondary)
                 }
 
+                if !attachedDevices.isEmpty {
+                    DetailSection(title: "🔗 Devices On This Controller") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("Nested by hub and port path so same-named devices are easier to distinguish.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+
+                            ForEach(attachedHierarchy) { node in
+                                USBHierarchyBranchView(node: node)
+                            }
+                        }
+                    }
+                }
+
                 if !controller.pciInfo.isEmpty {
                     DetailSection(title: "🔧 Technical: PCI Information") {
                         Text(controller.pciInfo)
@@ -1626,7 +4255,7 @@ struct ThunderboltDetailView: View {
         case 3: return "Thunderbolt 3 offers up to 40 Gbps – great for external drives, docks, and displays."
         case 2: return "Thunderbolt 2 offers up to 20 Gbps – still capable for external drives and displays."
         case 1: return "Original Thunderbolt offers up to 10 Gbps – faster than USB 3.0."
-        default: return "Thunderbolt is much faster than USB – perfect for demanding tasks like video editing."
+        default: return "macOS didn't expose an explicit Thunderbolt generation here, so this view keeps the interpretation conservative and leans on the raw registry data."
         }
     }
 
@@ -1736,6 +4365,69 @@ struct ThunderboltDetailView: View {
 struct RawDataOverview: View {
     @ObservedObject var manager: USBManager
 
+    var classGroups: [Int: [USBDevice]] {
+        Dictionary(grouping: manager.devices) { $0.effectiveClass }
+    }
+
+    var sortedClassIDs: [Int] {
+        classGroups.keys.sorted()
+    }
+
+    var hierarchySections: [USBHierarchySection] {
+        buildUSBHierarchySections(devices: manager.devices, controllers: manager.controllers)
+    }
+
+    @ViewBuilder
+    func deviceClassRow(for classID: Int) -> some View {
+        let devices = classGroups[classID] ?? []
+        let info: (name: String, description: String, icon: String, layman: String) = devices.first?.classInfo ?? ("Class \(classID)", "", "questionmark.circle", "Unknown device type")
+
+        HStack {
+            Image(systemName: info.icon)
+                .foregroundColor(.secondary)
+                .frame(width: 20)
+            Text(info.name)
+            Spacer()
+            Text("\(devices.count)")
+                .fontWeight(.medium)
+        }
+    }
+
+    @ViewBuilder
+    func hierarchyRow(for section: USBHierarchySection) -> some View {
+        let controller = section.controller
+
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: "cpu")
+                    .foregroundColor(.blue)
+                Text(section.controllerName)
+                    .font(.headline)
+                Spacer()
+                Text("\(section.visibleDeviceCount) devices")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            if let controller {
+                Text(controller.controllerType)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            Text("Controller at the top, then hubs, then downstream devices and Finder-visible volumes underneath each branch.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            ForEach(section.roots) { node in
+                USBHierarchyBranchView(node: node)
+            }
+        }
+        .padding()
+        .background(Color(nsColor: .controlBackgroundColor))
+        .cornerRadius(12)
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
@@ -1751,6 +4443,9 @@ struct RawDataOverview: View {
                     DetailRow(label: "Thunderbolt Devices", value: "\(manager.thunderboltDevices.count)")
                     DetailRow(label: "USB Hubs", value: "\(manager.devices.filter { $0.isHub }.count)")
                     DetailRow(label: "Internal Devices", value: "\(manager.devices.filter { $0.isInternal }.count)")
+                    DetailRow(label: "Composite Devices", value: "\(manager.devices.filter { $0.isCompositeDevice }.count)")
+                    DetailRow(label: "USB 3+ Running Slow", value: "\(manager.devices.filter { $0.isPerformanceLimited }.count)")
+                    DetailRow(label: "Mapped Finder Volumes", value: "\(manager.devices.flatMap(\.mountedVolumes).count)")
                 }
 
                 DetailSection(title: "Speed Distribution") {
@@ -1771,18 +4466,15 @@ struct RawDataOverview: View {
                 }
 
                 DetailSection(title: "Device Classes") {
-                    let classGroups = Dictionary(grouping: manager.devices) { $0.deviceClass }
-                    ForEach(classGroups.keys.sorted(), id: \.self) { classID in
-                        let devices = classGroups[classID] ?? []
-                        let info = usbClassDescriptions[classID] ?? ("Class \(classID)", "", "questionmark.circle", "Unknown device type")
-                        HStack {
-                            Image(systemName: info.icon)
-                                .foregroundColor(.secondary)
-                                .frame(width: 20)
-                            Text(info.name)
-                            Spacer()
-                            Text("\(devices.count)")
-                                .fontWeight(.medium)
+                    ForEach(sortedClassIDs, id: \.self) { classID in
+                        deviceClassRow(for: classID)
+                    }
+                }
+
+                DetailSection(title: "What Falls Under What") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        ForEach(hierarchySections) { section in
+                            hierarchyRow(for: section)
                         }
                     }
                 }
@@ -1808,7 +4500,7 @@ struct RawDataOverview: View {
 struct CollapsibleSection<Content: View>: View {
     let title: String
     let icon: String
-    @State var isExpanded: Bool
+    @Binding var isExpanded: Bool
     @ViewBuilder let content: Content
 
     var body: some View {
@@ -1912,6 +4604,23 @@ struct DetailRowWithHelp: View {
                     .padding(.leading, 4)
             }
         }
+    }
+}
+
+// MARK: - Metadata Pill
+struct MetadataPill: View {
+    let text: String
+    let accent: Color
+
+    var body: some View {
+        Text(text)
+            .font(.caption)
+            .fontWeight(.medium)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(accent.opacity(0.12))
+            .foregroundColor(accent)
+            .cornerRadius(999)
     }
 }
 
