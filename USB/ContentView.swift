@@ -441,6 +441,54 @@ private func formatByteCount(_ value: Int64) -> String {
     return formatter.string(fromByteCount: value)
 }
 
+private func formatUSBPowerAssumingFiveVolts(_ milliamps: Int) -> String {
+    guard milliamps > 0 else { return "Not reported" }
+    let watts = Double(milliamps) * 5.0 / 1000.0
+    return "\(milliamps) mA (\(String(format: "%.2f", watts)) W @ 5V)"
+}
+
+private func decodeUSBPortTypeCode(from value: Any?) -> Int? {
+    if let int = intValue(value) {
+        return int
+    }
+
+    if let data = value as? Data, !data.isEmpty {
+        return data.reduce(0) { partialResult, byte in
+            (partialResult << 8) | Int(byte)
+        }
+    }
+
+    return nil
+}
+
+private func usbPortTypeCodeDescription(_ code: Int?) -> String {
+    guard let code else { return "Not published" }
+
+    switch code {
+    case 0:
+        return "Code 0 (basic downstream port classification)"
+    case 5:
+        return "Code 5 (modern host-path classification; public marketing label not exposed)"
+    default:
+        return "Code \(code) (public label not exposed)"
+    }
+}
+
+private func powerFactString(for value: Any?) -> String? {
+    guard let value else { return nil }
+
+    if let string = value as? String {
+        return string
+    }
+    if let number = value as? NSNumber {
+        return number.stringValue
+    }
+    if let data = value as? Data, !data.isEmpty {
+        return data.map { String(format: "%02X", $0) }.joined(separator: " ")
+    }
+    return nil
+}
+
 private func formatTransferRate(_ bytesPerSecond: Double) -> String {
     guard bytesPerSecond > 0 else { return "0 B/s" }
     let formatter = ByteCountFormatter()
@@ -1631,6 +1679,18 @@ struct ThunderboltDevice: Identifiable, Hashable {
     }
 }
 
+struct USBPowerDetails: Hashable {
+    let reportedDeviceCurrentMilliamps: Int
+    let sinkAllocationMilliamps: Int
+    let wakePortCurrentLimitMilliamps: Int
+    let sleepPortCurrentLimitMilliamps: Int
+    let hubPowerSupplyMilliamps: Int
+    let usbPortTypeCode: Int?
+    let usbBusCurrentPoolID: UInt64
+    let overCurrentEventCount: Int
+    let powerRegistryFacts: [String]
+}
+
 // MARK: - USB Device Model
 struct USBDevice: Identifiable, Hashable {
     let id: String
@@ -1664,6 +1724,7 @@ struct USBDevice: Identifiable, Hashable {
     let currentConfiguration: Int
     let linkSpeedBitsPerSecond: Int64
     let portType: String
+    let powerDetails: USBPowerDetails
     let parentControllerName: String
     let interfaces: [USBInterfaceInfo]
     let rawProperties: [String: String]
@@ -2079,26 +2140,138 @@ struct USBDevice: Identifiable, Hashable {
 
     var powerDescription: String {
         if maxPower > 0 {
-            let watts = Double(maxPower) * 5.0 / 1000.0
-            return "\(maxPower) mA budget (\(String(format: "%.2f", watts)) W @ 5V)"
+            return "\(formatUSBPowerAssumingFiveVolts(maxPower)) negotiated budget"
         }
         return "N/A"
     }
 
     var descriptorPowerDescription: String {
         if descriptorMaxPowerMilliamps > 0 {
-            return "\(descriptorMaxPowerMilliamps) mA requested in descriptor"
+            return "\(formatUSBPowerAssumingFiveVolts(descriptorMaxPowerMilliamps)) requested in descriptor"
         }
         return "Not reported"
     }
 
     var powerAvailableDescription: String {
         if busPowerAvailable > 0 {
-            return "\(busPowerAvailable) mA available"
+            return formatUSBPowerAssumingFiveVolts(busPowerAvailable)
         } else if currentAvailable > 0 {
-            return "\(currentAvailable) mA available"
+            return formatUSBPowerAssumingFiveVolts(currentAvailable)
         }
         return "Standard bus power"
+    }
+
+    var bestAvailableAwakeCurrentMilliamps: Int {
+        [busPowerAvailable, currentAvailable, powerDetails.wakePortCurrentLimitMilliamps].max() ?? 0
+    }
+
+    var powerNegotiationSummary: String {
+        if powerDetails.sinkAllocationMilliamps > 0 {
+            return "macOS published UsbPowerSinkAllocation for this path, so the current budget shown here is closer to a negotiated sink allowance than a plain descriptor request."
+        }
+        if powerDetails.reportedDeviceCurrentMilliamps > 0 {
+            return "macOS published a device current value for this path, but not a richer sink-allocation contract."
+        }
+        if descriptorMaxPowerMilliamps > 0 {
+            return "macOS only exposed the descriptor-requested current here, so this is more of a requested ceiling than a fully explained negotiated contract."
+        }
+        return "macOS did not publish a clear current budget for this device path."
+    }
+
+    var pdVisibilitySummary: String {
+        let normalizedFacts = powerDetails.powerRegistryFacts.map(normalizedLookupToken)
+        let hasExplicitVoltageOrPDKey = normalizedFacts.contains {
+            $0.contains("voltage") || $0.contains("pdo") || $0.contains("pd ") || $0.contains("pd=") || $0.contains("typec")
+        }
+
+        if hasExplicitVoltageOrPDKey {
+            return "macOS exposed some PD- or Type-C-adjacent registry keys on this path, but not a clean public USB PD contract object."
+        }
+
+        if powerDetails.sinkAllocationMilliamps > 0 || bestAvailableAwakeCurrentMilliamps > 0 {
+            return "macOS exposed current budgets and port limits for this path, but not an explicit PD voltage/current contract. The watt figures here assume the standard 5V USB bus unless the OS publishes more."
+        }
+
+        return "macOS did not publish an explicit USB Power Delivery contract for this path."
+    }
+
+    var portTypeDescription: String {
+        if let code = powerDetails.usbPortTypeCode {
+            return usbPortTypeCodeDescription(code)
+        }
+
+        if !portType.isEmpty, portType != "Standard" {
+            return portType
+        }
+
+        return "Not published"
+    }
+
+    var wakePortLimitDescription: String {
+        powerDetails.wakePortCurrentLimitMilliamps > 0 ? formatUSBPowerAssumingFiveVolts(powerDetails.wakePortCurrentLimitMilliamps) : "Not published"
+    }
+
+    var sleepPortLimitDescription: String {
+        powerDetails.sleepPortCurrentLimitMilliamps > 0 ? formatUSBPowerAssumingFiveVolts(powerDetails.sleepPortCurrentLimitMilliamps) : "Not published"
+    }
+
+    var hubPowerSupplyDescription: String {
+        powerDetails.hubPowerSupplyMilliamps > 0 ? formatUSBPowerAssumingFiveVolts(powerDetails.hubPowerSupplyMilliamps) : "Not published"
+    }
+
+    var currentPoolDescription: String {
+        powerDetails.usbBusCurrentPoolID > 0 ? String(format: "0x%016llX", powerDetails.usbBusCurrentPoolID) : "Not published"
+    }
+
+    var overCurrentHistoryDescription: String {
+        if powerDetails.overCurrentEventCount > 0 {
+            return powerDetails.overCurrentEventCount == 1 ? "1 over-current event published" : "\(powerDetails.overCurrentEventCount) over-current events published"
+        }
+        return "No over-current events published"
+    }
+
+    var closestPublishedIntakeDescription: String {
+        if powerDetails.sinkAllocationMilliamps > 0 {
+            return "\(formatUSBPowerAssumingFiveVolts(powerDetails.sinkAllocationMilliamps)) sink allocation"
+        }
+
+        if powerDetails.reportedDeviceCurrentMilliamps > 0 {
+            return "\(formatUSBPowerAssumingFiveVolts(powerDetails.reportedDeviceCurrentMilliamps)) reported device current"
+        }
+
+        if maxPower > 0 {
+            return "\(formatUSBPowerAssumingFiveVolts(maxPower)) negotiated budget"
+        }
+
+        return "Not published"
+    }
+
+    var chargingCeilingDescription: String {
+        if bestAvailableAwakeCurrentMilliamps > 0 {
+            return "\(formatUSBPowerAssumingFiveVolts(bestAvailableAwakeCurrentMilliamps)) published awake port ceiling"
+        }
+
+        if powerDetails.hubPowerSupplyMilliamps > 0 {
+            return "\(formatUSBPowerAssumingFiveVolts(powerDetails.hubPowerSupplyMilliamps)) upstream hub supply"
+        }
+
+        return "Not published"
+    }
+
+    var drawInterpretationSummary: String {
+        if powerDetails.sinkAllocationMilliamps > 0 {
+            return "This is the best public clue macOS is giving for how much current this path is letting the device take right now."
+        }
+
+        if powerDetails.reportedDeviceCurrentMilliamps > 0 {
+            return "macOS is publishing a device current value here, but it still is not clearly labeled as a live real-time meter."
+        }
+
+        if bestAvailableAwakeCurrentMilliamps > 0 {
+            return "macOS is only giving a charging ceiling for the port path here, not the device's actual instantaneous draw."
+        }
+
+        return "macOS is not publishing either a live draw value or a clear charging ceiling for this path."
     }
 
     var classInfo: (name: String, description: String, icon: String, layman: String) {
@@ -2136,6 +2309,11 @@ struct USBDevice: Identifiable, Hashable {
         } else if maxPower > 0 && busPowerAvailable > 0 && maxPower > busPowerAvailable {
             score -= 15
             issues.append("🔋 The negotiated power budget is larger than the port's advertised budget")
+        }
+
+        if powerDetails.overCurrentEventCount > 0 {
+            score -= min(20, powerDetails.overCurrentEventCount * 5)
+            issues.append("⚠️ The upstream USB port path has logged \(powerDetails.overCurrentEventCount) over-current events")
         }
 
         if vendorID == 0 && productID == 0 {
@@ -3200,6 +3378,141 @@ class USBManager: ObservableObject {
         return props
     }
 
+    private func powerFacts(from properties: [String: Any]) -> [String] {
+        let interestingKeys = [
+            "Device Current",
+            "UsbPowerSinkAllocation",
+            "AAPL,current-available",
+            "Current Available",
+            "Bus Power Available",
+            "AAPL,current-extra-in-sleep",
+            "Sleep Current",
+            "AAPL,sleep-current",
+            "kUSBWakePortCurrentLimit",
+            "kUSBSleepPortCurrentLimit",
+            "kUSBHubPowerSupply",
+            "USBPortType",
+            "port-type",
+            "usb-port-type",
+            "UsbBusCurrentPoolID"
+        ]
+
+        return interestingKeys.compactMap { key in
+            guard let value = powerFactString(for: properties[key]) else { return nil }
+            return "\(key)=\(value)"
+        }
+    }
+
+    private func portStatisticFacts(from statistics: [String: Any]) -> [String] {
+        var facts: [String] = []
+
+        if let overCurrentCount = firstInt(in: statistics, keys: ["kPortStatOverCurrentCount"]) {
+            facts.append("kPortStatOverCurrentCount=\(overCurrentCount)")
+        }
+
+        if let connectCount = firstInt(in: statistics, keys: ["kPortStatConnectCount"]) {
+            facts.append("kPortStatConnectCount=\(connectCount)")
+        }
+
+        if let powerStateTimes = statistics["kPortStatPowerStateTime"] as? [String: Any] {
+            let summary = powerStateTimes
+                .map { "\($0.key)=\($0.value)" }
+                .sorted()
+                .joined(separator: ", ")
+            if !summary.isEmpty {
+                facts.append("kPortStatPowerStateTime=\(summary)")
+            }
+        }
+
+        return facts
+    }
+
+    private func collectUSBPowerDetails(
+        for service: io_service_t,
+        baseProperties: [String: Any],
+        reportedDeviceCurrent: Int,
+        sinkAllocation: Int
+    ) -> USBPowerDetails {
+        var wakePortCurrentLimit = firstInt(in: baseProperties, keys: ["kUSBWakePortCurrentLimit"]) ?? 0
+        var sleepPortCurrentLimit = firstInt(in: baseProperties, keys: ["kUSBSleepPortCurrentLimit"]) ?? 0
+        var hubPowerSupply = firstInt(in: baseProperties, keys: ["kUSBHubPowerSupply"]) ?? 0
+        var usbPortTypeCode = decodeUSBPortTypeCode(from: baseProperties["USBPortType"])
+            ?? decodeUSBPortTypeCode(from: baseProperties["usb-port-type"])
+            ?? decodeUSBPortTypeCode(from: baseProperties["port-type"])
+        var usbBusCurrentPoolID = firstUInt64(in: baseProperties, keys: ["UsbBusCurrentPoolID"]) ?? 0
+        var overCurrentEventCount = 0
+        var registryFacts = powerFacts(from: baseProperties)
+
+        if let portStatistics = baseProperties["port-statistics"] as? [String: Any] {
+            overCurrentEventCount = firstInt(in: portStatistics, keys: ["kPortStatOverCurrentCount"]) ?? 0
+            registryFacts.append(contentsOf: portStatisticFacts(from: portStatistics))
+        }
+
+        var current = service
+        var shouldReleaseCurrent = false
+
+        defer {
+            if shouldReleaseCurrent {
+                IOObjectRelease(current)
+            }
+        }
+
+        while true {
+            var parent: io_registry_entry_t = 0
+            guard IORegistryEntryGetParentEntry(current, kIOServicePlane, &parent) == KERN_SUCCESS else {
+                break
+            }
+
+            if shouldReleaseCurrent {
+                IOObjectRelease(current)
+            }
+
+            current = parent
+            shouldReleaseCurrent = true
+
+            guard let parentProperties = registryProperties(for: current) else { continue }
+
+            if wakePortCurrentLimit == 0 {
+                wakePortCurrentLimit = firstInt(in: parentProperties, keys: ["kUSBWakePortCurrentLimit"]) ?? 0
+            }
+            if sleepPortCurrentLimit == 0 {
+                sleepPortCurrentLimit = firstInt(in: parentProperties, keys: ["kUSBSleepPortCurrentLimit"]) ?? 0
+            }
+            if hubPowerSupply == 0 {
+                hubPowerSupply = firstInt(in: parentProperties, keys: ["kUSBHubPowerSupply"]) ?? 0
+            }
+            if usbPortTypeCode == nil {
+                usbPortTypeCode = decodeUSBPortTypeCode(from: parentProperties["USBPortType"])
+                    ?? decodeUSBPortTypeCode(from: parentProperties["usb-port-type"])
+                    ?? decodeUSBPortTypeCode(from: parentProperties["port-type"])
+            }
+            if usbBusCurrentPoolID == 0 {
+                usbBusCurrentPoolID = firstUInt64(in: parentProperties, keys: ["UsbBusCurrentPoolID"]) ?? 0
+            }
+
+            registryFacts.append(contentsOf: powerFacts(from: parentProperties))
+
+            if let portStatistics = parentProperties["port-statistics"] as? [String: Any] {
+                if overCurrentEventCount == 0 {
+                    overCurrentEventCount = firstInt(in: portStatistics, keys: ["kPortStatOverCurrentCount"]) ?? 0
+                }
+                registryFacts.append(contentsOf: portStatisticFacts(from: portStatistics))
+            }
+        }
+
+        return USBPowerDetails(
+            reportedDeviceCurrentMilliamps: reportedDeviceCurrent,
+            sinkAllocationMilliamps: sinkAllocation,
+            wakePortCurrentLimitMilliamps: wakePortCurrentLimit,
+            sleepPortCurrentLimitMilliamps: sleepPortCurrentLimit,
+            hubPowerSupplyMilliamps: hubPowerSupply,
+            usbPortTypeCode: usbPortTypeCode,
+            usbBusCurrentPoolID: usbBusCurrentPoolID,
+            overCurrentEventCount: overCurrentEventCount,
+            powerRegistryFacts: orderedUniqueStrings(registryFacts)
+        )
+    }
+
     private func createUSBDevice(from service: io_service_t) -> USBDevice? {
         var properties: Unmanaged<CFMutableDictionary>?
         guard IORegistryEntryCreateCFProperties(service, &properties, kCFAllocatorDefault, 0) == KERN_SUCCESS,
@@ -3234,6 +3547,12 @@ class USBManager: ObservableObject {
         let sessionID = firstUInt64(in: props, keys: ["sessionID"]) ?? 0
         let currentConfiguration = firstInt(in: props, keys: ["kUSBCurrentConfiguration"]) ?? 0
         let portType = firstString(in: props, keys: ["port-type", "Port Type", "USBPortType"]) ?? "Standard"
+        let powerDetails = collectUSBPowerDetails(
+            for: service,
+            baseProperties: props,
+            reportedDeviceCurrent: deviceCurrent,
+            sinkAllocation: sinkAllocation
+        )
         let interfaces = scanUSBInterfaces(for: service)
         let speed = USBSpeed.resolve(deviceSpeed: deviceSpeed, usbSpeed: usbSpeed, linkSpeedBitsPerSecond: linkSpeedBitsPerSecond)
 
@@ -3316,6 +3635,7 @@ class USBManager: ObservableObject {
             currentConfiguration: currentConfiguration,
             linkSpeedBitsPerSecond: linkSpeedBitsPerSecond,
             portType: portType,
+            powerDetails: powerDetails,
             parentControllerName: parentName,
             interfaces: interfaces,
             rawProperties: rawProps
@@ -5090,7 +5410,7 @@ struct DeviceDetailView: View {
             DetailRow(label: "Protocol", value: "\(device.deviceProtocol)")
             DetailRow(label: "Interfaces", value: "\(device.interfaces.count)")
             DetailRow(label: "Negotiated Link", value: device.negotiatedSpeedDescription)
-            DetailRow(label: "Port Type", value: device.portType)
+            DetailRow(label: "Port Type", value: device.portTypeDescription)
             if device.currentConfiguration > 0 {
                 DetailRow(label: "Configuration", value: "\(device.currentConfiguration)")
             }
@@ -5102,14 +5422,33 @@ struct DeviceDetailView: View {
 
     var powerSection: some View {
         let comparisonPower = device.descriptorMaxPowerMilliamps > 0 ? device.descriptorMaxPowerMilliamps : device.maxPower
+        let awakeBudget = device.bestAvailableAwakeCurrentMilliamps
 
-        return VStack(alignment: .leading, spacing: 10) {
-            // Power explanation
-            Text("⚡ What power budget did macOS negotiate?")
+        return VStack(alignment: .leading, spacing: 12) {
+            Text("⚡ What power did macOS actually publish for this USB path?")
                 .font(.subheadline)
                 .fontWeight(.medium)
 
-            // Visual power meter
+            Text("This section separates descriptor requests, negotiated current budgeting, port current limits, and hub supply clues. Watt figures assume the normal 5V USB bus unless macOS publishes a richer PD contract, which it usually does not in these public registry properties.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Closest answer to 'how much is it taking?' ")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundColor(.secondary)
+
+                DetailRow(label: "Closest published intake", value: device.closestPublishedIntakeDescription)
+                DetailRow(label: "Port charging ceiling", value: device.chargingCeilingDescription)
+
+                Text(device.drawInterpretationSummary)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            Divider()
+
             if comparisonPower > 0 {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
@@ -5117,48 +5456,75 @@ struct DeviceDetailView: View {
                             .font(.caption)
                             .foregroundColor(.secondary)
                         Spacer()
-                        if device.busPowerAvailable > 0 {
-                            Text(comparisonPower > device.busPowerAvailable ? "⚠️ Over budget" : "✅ Within budget")
+                        if awakeBudget > 0 {
+                            Text(comparisonPower > awakeBudget ? "⚠️ Above published port limit" : "✅ Within published port limit")
                                 .font(.caption)
                                 .fontWeight(.medium)
                         }
                     }
 
-                    if device.busPowerAvailable > 0 {
+                    if awakeBudget > 0 {
                         GeometryReader { geo in
                             ZStack(alignment: .leading) {
                                 RoundedRectangle(cornerRadius: 6)
                                     .fill(Color.gray.opacity(0.2))
                                 RoundedRectangle(cornerRadius: 6)
-                                    .fill(comparisonPower > device.busPowerAvailable ? Color.red : Color.green)
-                                    .frame(width: geo.size.width * min(CGFloat(comparisonPower) / CGFloat(device.busPowerAvailable), 1.0))
+                                    .fill(comparisonPower > awakeBudget ? Color.red : Color.green)
+                                    .frame(width: geo.size.width * min(CGFloat(comparisonPower) / CGFloat(awakeBudget), 1.0))
                             }
                         }
                         .frame(height: 10)
                     }
 
-                    // Plain English power info
-                    let watts = Double(device.maxPower) * 5.0 / 1000.0
-                    let wattsString = String(format: "%.1f", watts)
-                    Text("Negotiated budget: \(device.maxPower) mA (\(wattsString) watts)")
+                    Text("Negotiated budget: \(device.powerDescription)")
                         .font(.callout)
 
-                    Text(device.descriptorPowerDescription)
+                    Text(device.powerNegotiationSummary)
                         .font(.caption)
                         .foregroundColor(.secondary)
-
-                    if device.busPowerAvailable > 0 {
-                        Text("Port reports up to \(device.busPowerAvailable) mA available")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
                 }
 
                 Divider()
             }
 
-            // What this means
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Published by macOS")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundColor(.secondary)
+
+                DetailRow(label: "Descriptor request", value: device.descriptorPowerDescription)
+                DetailRow(label: "Negotiated budget", value: device.powerDescription)
+                if device.powerDetails.sinkAllocationMilliamps > 0 {
+                    DetailRow(label: "Sink allocation", value: formatUSBPowerAssumingFiveVolts(device.powerDetails.sinkAllocationMilliamps))
+                }
+                if device.powerDetails.reportedDeviceCurrentMilliamps > 0 {
+                    DetailRow(label: "Device current", value: formatUSBPowerAssumingFiveVolts(device.powerDetails.reportedDeviceCurrentMilliamps))
+                }
+                DetailRow(label: "Advertised available current", value: device.powerAvailableDescription)
+                DetailRow(label: "Wake port limit", value: device.wakePortLimitDescription)
+                DetailRow(label: "Sleep port limit", value: device.sleepPortLimitDescription)
+                if device.powerDetails.hubPowerSupplyMilliamps > 0 {
+                    DetailRow(label: "Hub power supply", value: device.hubPowerSupplyDescription)
+                }
+                DetailRow(label: "Port type code", value: device.portTypeDescription)
+                if device.powerDetails.usbBusCurrentPoolID > 0 {
+                    DetailRow(label: "Current pool", value: device.currentPoolDescription)
+                }
+                DetailRow(label: "Over-current history", value: device.overCurrentHistoryDescription)
+            }
+
+            Divider()
+
             VStack(alignment: .leading, spacing: 4) {
+                Text("PD / USB-C visibility")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundColor(.secondary)
+
+                Text(device.pdVisibilitySummary)
+                    .font(.callout)
+
                 if comparisonPower > 500 {
                     Label("High-power device – may need a powered hub or direct connection", systemImage: "bolt.fill")
                         .font(.caption)
@@ -5174,21 +5540,51 @@ struct DeviceDetailView: View {
                 }
             }
 
-            if device.sleepCurrent > 0 || device.extraCurrentInSleep > 0 {
+            if device.sleepCurrent > 0 || device.extraCurrentInSleep > 0 || device.powerDetails.sleepPortCurrentLimitMilliamps > 0 || device.powerDetails.wakePortCurrentLimitMilliamps > 0 {
                 Divider()
-                Text("💤 While computer sleeps:")
+                Text("Sleep / wake behavior")
                     .font(.caption)
+                    .fontWeight(.semibold)
                     .foregroundColor(.secondary)
+
                 if device.sleepCurrent > 0 {
-                    Text("Uses \(device.sleepCurrent) mA to stay ready")
+                    Text("The device says it uses \(formatUSBPowerAssumingFiveVolts(device.sleepCurrent)) to stay ready while the Mac sleeps.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
                 if device.extraCurrentInSleep > 0 {
-                    Text("Can request an extra \(device.extraCurrentInSleep) mA during sleep")
+                    Text("The device can request an extra \(formatUSBPowerAssumingFiveVolts(device.extraCurrentInSleep)) during sleep.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
+                if device.powerDetails.wakePortCurrentLimitMilliamps > 0 {
+                    Text("The upstream port publishes an awake current limit of \(device.wakePortLimitDescription).")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                if device.powerDetails.sleepPortCurrentLimitMilliamps > 0 {
+                    Text("The upstream port publishes a sleep-state current limit of \(device.sleepPortLimitDescription).")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            if !device.powerDetails.powerRegistryFacts.isEmpty {
+                Divider()
+
+                DisclosureGroup("Exact registry power fields") {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(device.powerDetails.powerRegistryFacts, id: \.self) { fact in
+                            Text(fact)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundColor(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .padding(.top, 4)
+                }
+                .font(.caption)
+                .foregroundColor(.secondary)
             }
         }
     }
