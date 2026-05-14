@@ -28,6 +28,17 @@ let kUSBDeviceSubClass = "bDeviceSubClass"
 let kUSBDeviceProtocol = "bDeviceProtocol"
 let kUSBMaxPower = "bMaxPower"
 let kUSBDevicePropertyLocationID = "locationID"
+let kIOBlockStorageStatisticsKey = "Statistics"
+let kIOBlockStorageBytesReadKey = "Bytes (Read)"
+let kIOBlockStorageBytesWrittenKey = "Bytes (Write)"
+let kIOBlockStorageReadErrorsKey = "Errors (Read)"
+let kIOBlockStorageWriteErrorsKey = "Errors (Write)"
+let kIOBlockStorageReadRetriesKey = "Retries (Read)"
+let kIOBlockStorageWriteRetriesKey = "Retries (Write)"
+let kIOBlockStorageReadOperationsKey = "Operations (Read)"
+let kIOBlockStorageWriteOperationsKey = "Operations (Write)"
+let kIOBlockStorageTotalReadTimeKey = "Total Time (Read)"
+let kIOBlockStorageTotalWriteTimeKey = "Total Time (Write)"
 #endif
 
 // MARK: - USB Device Class Descriptions (with layman explanations)
@@ -133,6 +144,249 @@ struct StorageVolumeInfo: Identifiable, Hashable {
     }
 }
 
+enum StorageTrafficDirection: String, Hashable {
+    case idle
+    case reading
+    case writing
+    case mixed
+
+    var label: String {
+        switch self {
+        case .idle: return "Idle"
+        case .reading: return "Reading"
+        case .writing: return "Writing"
+        case .mixed: return "Read + Write"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .idle: return "pause.circle"
+        case .reading: return "arrow.down.circle.fill"
+        case .writing: return "arrow.up.circle.fill"
+        case .mixed: return "arrow.up.and.down.circle.fill"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .idle: return .secondary
+        case .reading: return .blue
+        case .writing: return .orange
+        case .mixed: return .purple
+        }
+    }
+
+    var explanation: String {
+        switch self {
+        case .idle:
+            return "No meaningful block-level disk traffic was observed in the current sample window."
+        case .reading:
+            return "macOS is actively pulling data off this device right now."
+        case .writing:
+            return "macOS is actively pushing data onto this device right now."
+        case .mixed:
+            return "macOS is reading from and writing to this device in the same sample window."
+        }
+    }
+}
+
+struct BlockStorageCounters: Hashable {
+    let bytesRead: Int64
+    let bytesWritten: Int64
+    let readErrors: Int64
+    let writeErrors: Int64
+    let readRetries: Int64
+    let writeRetries: Int64
+    let readOperations: Int64
+    let writeOperations: Int64
+    let totalReadTimeNanoseconds: Int64
+    let totalWriteTimeNanoseconds: Int64
+}
+
+struct BlockStorageSample: Hashable {
+    let sampleDate: Date
+    let counters: BlockStorageCounters
+}
+
+struct VolumeCapacitySample: Hashable {
+    let sampleDate: Date
+    let availableBytes: Int64
+    let capacityBytes: Int64
+}
+
+struct LiveMountedVolumeState: Identifiable, Hashable {
+    let bsdName: String
+    let sampleDate: Date
+    let capacityBytes: Int64
+    let availableBytes: Int64
+    let availableBytesPerSecond: Double
+    let isReadOnly: Bool
+    let formatDescription: String
+
+    var id: String { bsdName }
+
+    var usedBytes: Int64 {
+        max(capacityBytes - availableBytes, 0)
+    }
+
+    var usageFraction: Double? {
+        guard capacityBytes > 0 else { return nil }
+        return min(max(Double(usedBytes) / Double(capacityBytes), 0), 1)
+    }
+
+    var usageDescription: String {
+        guard capacityBytes > 0 else { return "Capacity unknown" }
+        return "\(formatByteCount(usedBytes)) used of \(formatByteCount(capacityBytes))"
+    }
+
+    var freeDescription: String {
+        guard capacityBytes > 0 else { return "Free space unknown" }
+        return "\(formatByteCount(availableBytes)) free"
+    }
+
+    var freeChangeDescription: String? {
+        guard abs(availableBytesPerSecond) >= 8_192 else { return nil }
+        let direction = availableBytesPerSecond > 0 ? "Free space rising" : "Free space dropping"
+        return "\(direction) at \(formatTransferRate(abs(availableBytesPerSecond)))"
+    }
+
+    var accessibilitySummary: String {
+        isReadOnly ? "Read-only" : "Writable"
+    }
+}
+
+struct LiveWholeDiskActivity: Identifiable, Hashable {
+    let wholeDiskBSDName: String
+    let sampleDate: Date
+    let direction: StorageTrafficDirection
+    let readBytesPerSecond: Double
+    let writeBytesPerSecond: Double
+    let readOperationsPerSecond: Double
+    let writeOperationsPerSecond: Double
+    let totalBytesRead: Int64
+    let totalBytesWritten: Int64
+    let totalReadErrors: Int64
+    let totalWriteErrors: Int64
+    let totalReadRetries: Int64
+    let totalWriteRetries: Int64
+    let readErrorDelta: Int64
+    let writeErrorDelta: Int64
+    let readRetryDelta: Int64
+    let writeRetryDelta: Int64
+    let averageReadLatencyMilliseconds: Double?
+    let averageWriteLatencyMilliseconds: Double?
+    let lastActiveAt: Date?
+
+    var id: String { wholeDiskBSDName }
+
+    var isBusy: Bool {
+        direction != .idle
+    }
+
+    var throughputSummary: String {
+        switch direction {
+        case .idle:
+            return "Idle"
+        case .reading:
+            return "\(formatTransferRate(readBytesPerSecond)) read"
+        case .writing:
+            return "\(formatTransferRate(writeBytesPerSecond)) write"
+        case .mixed:
+            return "\(formatTransferRate(readBytesPerSecond)) read • \(formatTransferRate(writeBytesPerSecond)) write"
+        }
+    }
+
+    var operationSummary: String {
+        switch direction {
+        case .idle:
+            return "No active I/O operations detected"
+        case .reading:
+            return "\(formatOperationRate(readOperationsPerSecond)) read ops"
+        case .writing:
+            return "\(formatOperationRate(writeOperationsPerSecond)) write ops"
+        case .mixed:
+            return "\(formatOperationRate(readOperationsPerSecond)) read ops • \(formatOperationRate(writeOperationsPerSecond)) write ops"
+        }
+    }
+
+    var latencySummary: String? {
+        var parts: [String] = []
+        if let averageReadLatencyMilliseconds, averageReadLatencyMilliseconds > 0.01 {
+            parts.append(String(format: "%.1f ms read latency", averageReadLatencyMilliseconds))
+        }
+        if let averageWriteLatencyMilliseconds, averageWriteLatencyMilliseconds > 0.01 {
+            parts.append(String(format: "%.1f ms write latency", averageWriteLatencyMilliseconds))
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " • ")
+    }
+
+    var reliabilitySummary: String? {
+        var parts: [String] = []
+        if readErrorDelta > 0 || writeErrorDelta > 0 {
+            parts.append("Errors changed by +\(readErrorDelta + writeErrorDelta) in this sample")
+        }
+        if readRetryDelta > 0 || writeRetryDelta > 0 {
+            parts.append("Retries changed by +\(readRetryDelta + writeRetryDelta) in this sample")
+        }
+        if totalReadErrors > 0 || totalWriteErrors > 0 {
+            parts.append("Total errors: \(totalReadErrors + totalWriteErrors)")
+        }
+        if totalReadRetries > 0 || totalWriteRetries > 0 {
+            parts.append("Total retries: \(totalReadRetries + totalWriteRetries)")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " • ")
+    }
+}
+
+struct DeviceStorageActivity: Hashable {
+    let deviceID: String
+    let sampleDate: Date
+    let direction: StorageTrafficDirection
+    let readBytesPerSecond: Double
+    let writeBytesPerSecond: Double
+    let readOperationsPerSecond: Double
+    let writeOperationsPerSecond: Double
+    let activeDiskCount: Int
+    let wholeDiskBSDNames: [String]
+    let busiestDiskBSDName: String?
+    let lastActiveAt: Date?
+
+    var isBusy: Bool {
+        direction != .idle
+    }
+
+    var compactBadgeText: String? {
+        guard isBusy else { return nil }
+        switch direction {
+        case .idle:
+            return nil
+        case .reading:
+            return "Read \(formatTransferRate(readBytesPerSecond))"
+        case .writing:
+            return "Write \(formatTransferRate(writeBytesPerSecond))"
+        case .mixed:
+            return "Busy \(formatTransferRate(max(readBytesPerSecond, writeBytesPerSecond)))"
+        }
+    }
+
+    var summary: String {
+        switch direction {
+        case .idle:
+            if let lastActiveAt {
+                return "Idle right now. Last meaningful storage activity was \(relativeTimestampDescription(lastActiveAt))."
+            }
+            return "Idle right now. No recent block-level storage activity has been sampled yet."
+        case .reading:
+            return "macOS is currently reading from this device at about \(formatTransferRate(readBytesPerSecond))."
+        case .writing:
+            return "macOS is currently writing to this device at about \(formatTransferRate(writeBytesPerSecond))."
+        case .mixed:
+            return "macOS is reading and writing at the same time: \(formatTransferRate(readBytesPerSecond)) read and \(formatTransferRate(writeBytesPerSecond)) write."
+        }
+    }
+}
+
 private func normalizedLookupToken(_ value: String) -> String {
     value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
         .lowercased()
@@ -185,6 +439,51 @@ private func formatByteCount(_ value: Int64) -> String {
     formatter.includesUnit = true
     formatter.isAdaptive = true
     return formatter.string(fromByteCount: value)
+}
+
+private func formatTransferRate(_ bytesPerSecond: Double) -> String {
+    guard bytesPerSecond > 0 else { return "0 B/s" }
+    let formatter = ByteCountFormatter()
+    formatter.allowedUnits = [.useBytes, .useKB, .useMB, .useGB, .useTB]
+    formatter.countStyle = .file
+    formatter.includesUnit = true
+    formatter.isAdaptive = true
+    return formatter.string(fromByteCount: Int64(max(bytesPerSecond, 1))) + "/s"
+}
+
+private func formatOperationRate(_ operationsPerSecond: Double) -> String {
+    guard operationsPerSecond > 0 else { return "0.0" }
+    if operationsPerSecond >= 100 {
+        return String(format: "%.0f", operationsPerSecond)
+    }
+    if operationsPerSecond >= 10 {
+        return String(format: "%.1f", operationsPerSecond)
+    }
+    return String(format: "%.2f", operationsPerSecond)
+}
+
+private func relativeTimestampDescription(_ date: Date) -> String {
+    let formatter = RelativeDateTimeFormatter()
+    formatter.unitsStyle = .full
+    return formatter.localizedString(for: date, relativeTo: Date())
+}
+
+private func resolveStorageTrafficDirection(readBytesPerSecond: Double, writeBytesPerSecond: Double, readOperationsPerSecond: Double, writeOperationsPerSecond: Double) -> StorageTrafficDirection {
+    let byteThreshold = 32_768.0
+    let operationThreshold = 0.25
+    let hasRead = readBytesPerSecond >= byteThreshold || readOperationsPerSecond >= operationThreshold
+    let hasWrite = writeBytesPerSecond >= byteThreshold || writeOperationsPerSecond >= operationThreshold
+
+    switch (hasRead, hasWrite) {
+    case (false, false):
+        return .idle
+    case (true, false):
+        return .reading
+    case (false, true):
+        return .writing
+    case (true, true):
+        return .mixed
+    }
 }
 
 private func stableUSBDeviceID(vendorID: Int, productID: Int, serialNumber: String, sessionID: UInt64, locationID: UInt32, name: String) -> String {
@@ -992,6 +1291,14 @@ private func intValue(_ value: Any?) -> Int? {
     return nil
 }
 
+private func int64Value(_ value: Any?) -> Int64? {
+    if let int = value as? Int64 { return int }
+    if let int = value as? Int { return Int64(int) }
+    if let number = value as? NSNumber { return number.int64Value }
+    if let string = value as? String { return Int64(string) }
+    return nil
+}
+
 private func uint32Value(_ value: Any?) -> UInt32? {
     if let number = value as? NSNumber { return number.uint32Value }
     if let int = value as? Int { return UInt32(int) }
@@ -1158,6 +1465,27 @@ struct USBController: Identifiable, Hashable {
         }
         return "Bus powered"
     }
+
+    var displayName: String {
+        if name.hasPrefix("AppleUSB") || name.hasPrefix("IOUSB") {
+            if isBuiltIn {
+                return supportsUSB3 ? "Built-in USB 3 Controller" : "Built-in USB 2 Controller"
+            }
+            return controllerType
+        }
+        return name
+    }
+
+    var technicalNameDescription: String? {
+        displayName == name ? nil : name
+    }
+
+    var usageSummary: String {
+        if supportsUSB3 {
+            return "Use this view when you want to see which ports, hubs, and devices are sharing the same high-speed USB controller."
+        }
+        return "Use this view when something feels slow and you want to confirm it landed on an older USB 2-era controller path."
+    }
 }
 
 // MARK: - Thunderbolt Device Model
@@ -1206,6 +1534,100 @@ struct ThunderboltDevice: Identifiable, Hashable {
         case 5: return .pink
         default: return .gray
         }
+    }
+
+    private var normalizedRegistryName: String {
+        normalizedLookupToken(name)
+    }
+
+    var isPortEntry: Bool {
+        normalizedRegistryName.contains("iothunderboltport") || name.contains("Port@")
+    }
+
+    var isSwitchEntry: Bool {
+        normalizedRegistryName.contains("switch")
+    }
+
+    var portNumber: Int? {
+        guard isPortEntry, let suffix = name.split(separator: "@").last else { return nil }
+        return Int(suffix)
+    }
+
+    var displayName: String {
+        if isPortEntry, let portNumber {
+            return "Thunderbolt Port \(portNumber)"
+        }
+
+        if !deviceName.isEmpty && deviceName != name {
+            if !vendorName.isEmpty && !normalizedLookupToken(deviceName).contains(normalizedLookupToken(vendorName)) {
+                return "\(vendorName) \(deviceName)"
+            }
+            return deviceName
+        }
+
+        if isSwitchEntry {
+            return routeString == "0" ? "Built-in Thunderbolt Router" : "Thunderbolt Switch"
+        }
+
+        return name
+    }
+
+    var roleTitle: String {
+        if isPortEntry {
+            return "Port on this Mac"
+        }
+        if isSwitchEntry {
+            return routeString == "0" ? "Routing node inside the Mac" : "Thunderbolt routing / switch node"
+        }
+        return "Connected Thunderbolt-side device"
+    }
+
+    var userFacingSubtitle: String {
+        orderedUniqueStrings([roleTitle, generationString, vendorName]).joined(separator: " • ")
+    }
+
+    var howToUseSummary: String {
+        if isPortEntry {
+            return "This is a Thunderbolt-capable port path on the Mac. Open it when you need to trace which Thunderbolt route a dock, display, or SSD is using."
+        }
+        if isSwitchEntry {
+            return "This is Thunderbolt plumbing rather than a Finder-visible device. It matters when you are diagnosing docks, display chains, cable paths, or routing weirdness."
+        }
+        return "This is the Thunderbolt-side endpoint or routed device entry. Use it to reason about connection status and bandwidth for docks, displays, and top-end external storage."
+    }
+
+    var whenToIgnoreSummary: String? {
+        if isPortEntry {
+            return "You can usually ignore this if everything works. It becomes useful when you are tracing a cable/port path or comparing routes."
+        }
+        if isSwitchEntry {
+            return "You can usually ignore this if you are just looking for files or normal removable devices. It is mainly for advanced path diagnosis."
+        }
+        return nil
+    }
+
+    var checklist: [String] {
+        if isPortEntry {
+            return [
+                "Use this to answer which Thunderbolt-capable port or lane a dock or display chain is actually using.",
+                "If a dock or SSD feels off, compare the reported link speed here with what you expected.",
+                "This is infrastructure, not a Finder-visible disk or app-level peripheral."
+            ]
+        }
+
+        if isSwitchEntry {
+            return [
+                "Think of this as traffic plumbing inside the Mac, dock, or routed Thunderbolt path.",
+                "Open this when you need to trace a dock, display chain, or cable path rather than a normal USB storage device.",
+                "If you are looking for something to eject or open in Finder, this usually is not the entry you want."
+            ]
+        }
+
+        return [
+            "Use this for docks, displays, capture gear, and high-end Thunderbolt storage rather than normal USB flash drives.",
+            "Current link speed is the first thing to check if performance feels lower than expected.",
+            "If this looks disconnected or weird, suspect the cable, dock power, adapter chain, or downstream device."
+        ]
     }
 }
 
@@ -1952,6 +2374,9 @@ class USBManager: ObservableObject {
     @Published var devices: [USBDevice] = []
     @Published var controllers: [USBController] = []
     @Published var thunderboltDevices: [ThunderboltDevice] = []
+    @Published var liveDiskActivity: [String: LiveWholeDiskActivity] = [:]
+    @Published var liveVolumeState: [String: LiveMountedVolumeState] = [:]
+    @Published var liveDeviceActivity: [String: DeviceStorageActivity] = [:]
     @Published var lastUpdated: Date = Date()
     @Published var isScanning: Bool = false
     @Published var scanLog: [String] = []
@@ -1959,13 +2384,32 @@ class USBManager: ObservableObject {
     private var notificationPort: IONotificationPortRef?
     private var addedIterator: io_iterator_t = 0
     private var removedIterator: io_iterator_t = 0
+    private var diskArbitrationSession: DASession?
+    private var workspaceObservers: [NSObjectProtocol] = []
+    private var activityTimer: AnyCancellable?
+    private var pendingRefreshWorkItem: DispatchWorkItem?
+    private var refreshQueuedWhileScanning = false
+    private var isSamplingLiveStorage = false
+    private var previousBlockStorageSamples: [String: BlockStorageSample] = [:]
+    private var previousVolumeCapacitySamples: [String: VolumeCapacitySample] = [:]
+    private var lastActiveDiskTimestamps: [String: Date] = [:]
+    private let liveMonitoringQueue = DispatchQueue(label: "USBManager.LiveMonitoring", qos: .utility)
 
     init() {
         refreshAll()
         setupUSBNotifications()
+        setupDiskArbitrationMonitoring()
+        setupWorkspaceVolumeNotifications()
+        startLiveStorageMonitoring()
     }
 
     deinit {
+        activityTimer?.cancel()
+        pendingRefreshWorkItem?.cancel()
+        workspaceObservers.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }
+        if let diskArbitrationSession {
+            DASessionSetDispatchQueue(diskArbitrationSession, nil)
+        }
         if addedIterator != 0 { IOObjectRelease(addedIterator) }
         if removedIterator != 0 { IOObjectRelease(removedIterator) }
         if let port = notificationPort { IONotificationPortDestroy(port) }
@@ -1976,6 +2420,17 @@ class USBManager: ObservableObject {
             self.scanLog.append("[\(Date().formatted(date: .omitted, time: .standard))] \(message)")
             if self.scanLog.count > 100 { self.scanLog.removeFirst() }
         }
+    }
+
+    private func scheduleRefresh(reason: String, delay: TimeInterval = 0.35) {
+        log(reason)
+
+        pendingRefreshWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.refreshAll()
+        }
+        pendingRefreshWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
     private func setupUSBNotifications() {
@@ -1992,9 +2447,7 @@ class USBManager: ObservableObject {
             { (refcon, iterator) in
                 while case let device = IOIteratorNext(iterator), device != 0 { IOObjectRelease(device) }
                 guard let refcon = refcon else { return }
-                DispatchQueue.main.async {
-                    Unmanaged<USBManager>.fromOpaque(refcon).takeUnretainedValue().refreshAll()
-                }
+                Unmanaged<USBManager>.fromOpaque(refcon).takeUnretainedValue().scheduleRefresh(reason: "USB device attach/change detected")
             }, selfPtr, &addedIterator)
 
         while case let device = IOIteratorNext(addedIterator), device != 0 { IOObjectRelease(device) }
@@ -2004,15 +2457,81 @@ class USBManager: ObservableObject {
             { (refcon, iterator) in
                 while case let device = IOIteratorNext(iterator), device != 0 { IOObjectRelease(device) }
                 guard let refcon = refcon else { return }
-                DispatchQueue.main.async {
-                    Unmanaged<USBManager>.fromOpaque(refcon).takeUnretainedValue().refreshAll()
-                }
+                Unmanaged<USBManager>.fromOpaque(refcon).takeUnretainedValue().scheduleRefresh(reason: "USB device removal detected")
             }, selfPtr, &removedIterator)
 
         while case let device = IOIteratorNext(removedIterator), device != 0 { IOObjectRelease(device) }
     }
 
+    private func setupDiskArbitrationMonitoring() {
+        guard let session = DASessionCreate(kCFAllocatorDefault) else { return }
+
+        diskArbitrationSession = session
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+
+        DARegisterDiskAppearedCallback(session, nil, { disk, context in
+            guard let context, let bsdName = DADiskGetBSDName(disk) else { return }
+            let manager = Unmanaged<USBManager>.fromOpaque(context).takeUnretainedValue()
+            manager.scheduleRefresh(reason: "Disk appeared: \(String(cString: bsdName))")
+        }, selfPtr)
+
+        DARegisterDiskDisappearedCallback(session, nil, { disk, context in
+            guard let context, let bsdName = DADiskGetBSDName(disk) else { return }
+            let manager = Unmanaged<USBManager>.fromOpaque(context).takeUnretainedValue()
+            manager.scheduleRefresh(reason: "Disk disappeared: \(String(cString: bsdName))")
+        }, selfPtr)
+
+        DARegisterDiskDescriptionChangedCallback(session, nil, kDADiskDescriptionWatchVolumePath.takeUnretainedValue(), { disk, _, context in
+            guard let context, let bsdName = DADiskGetBSDName(disk) else { return }
+            let manager = Unmanaged<USBManager>.fromOpaque(context).takeUnretainedValue()
+            manager.scheduleRefresh(reason: "Volume mount path changed: \(String(cString: bsdName))")
+        }, selfPtr)
+
+        DARegisterDiskDescriptionChangedCallback(session, nil, kDADiskDescriptionWatchVolumeName.takeUnretainedValue(), { disk, _, context in
+            guard let context, let bsdName = DADiskGetBSDName(disk) else { return }
+            let manager = Unmanaged<USBManager>.fromOpaque(context).takeUnretainedValue()
+            manager.scheduleRefresh(reason: "Volume name changed: \(String(cString: bsdName))")
+        }, selfPtr)
+
+        DASessionSetDispatchQueue(session, liveMonitoringQueue)
+    }
+
+    private func setupWorkspaceVolumeNotifications() {
+        let notificationCenter = NSWorkspace.shared.notificationCenter
+
+        workspaceObservers.append(
+            notificationCenter.addObserver(forName: NSWorkspace.didMountNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.scheduleRefresh(reason: "Finder mounted a volume")
+            }
+        )
+
+        workspaceObservers.append(
+            notificationCenter.addObserver(forName: NSWorkspace.didUnmountNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.scheduleRefresh(reason: "Finder unmounted a volume")
+            }
+        )
+
+        workspaceObservers.append(
+            notificationCenter.addObserver(forName: NSWorkspace.didRenameVolumeNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.scheduleRefresh(reason: "Finder renamed a volume")
+            }
+        )
+    }
+
+    private func startLiveStorageMonitoring() {
+        activityTimer = Timer.publish(every: 1.0, on: .main, in: .common)
+            .autoconnect()
+            .sink { [weak self] _ in
+                self?.sampleLiveStorageMetrics()
+            }
+    }
+
     func refreshAll() {
+        if isScanning {
+            refreshQueuedWhileScanning = true
+            return
+        }
+
         isScanning = true
         log("Starting full scan...")
 
@@ -2040,8 +2559,306 @@ class USBManager: ObservableObject {
                     self?.log("Disconnected: \(disconnectedDevices.map(\.logName).joined(separator: ", "))")
                 }
                 self?.log("Scan complete: \(devices.count) USB devices, \(controllers.count) controllers, \(thunderbolt.count) Thunderbolt devices")
+                self?.sampleLiveStorageMetrics(force: true)
+
+                if self?.refreshQueuedWhileScanning == true {
+                    self?.refreshQueuedWhileScanning = false
+                    self?.refreshAll()
+                }
             }
         }
+    }
+
+    private func sampleLiveStorageMetrics(force: Bool = false) {
+        let deviceSnapshot = devices
+        let storageDevices = deviceSnapshot.filter { !$0.storageVolumes.isEmpty }
+
+        guard !storageDevices.isEmpty else {
+            liveDiskActivity = [:]
+            liveVolumeState = [:]
+            liveDeviceActivity = [:]
+            previousBlockStorageSamples = [:]
+            previousVolumeCapacitySamples = [:]
+            lastActiveDiskTimestamps = [:]
+            return
+        }
+
+        guard !isSamplingLiveStorage else { return }
+        isSamplingLiveStorage = true
+
+        let previousBlockSamples = previousBlockStorageSamples
+        let previousVolumeSamples = previousVolumeCapacitySamples
+        let previousLastActive = lastActiveDiskTimestamps
+
+        liveMonitoringQueue.async { [weak self] in
+            guard let self else { return }
+
+            let now = Date()
+            let diskResult = self.collectLiveDiskActivity(
+                for: storageDevices,
+                at: now,
+                previousSamples: previousBlockSamples,
+                previousLastActive: previousLastActive
+            )
+            let volumeResult = self.collectMountedVolumeStates(
+                for: storageDevices,
+                at: now,
+                previousSamples: previousVolumeSamples
+            )
+            let deviceActivity = self.aggregateDeviceActivity(for: storageDevices, diskActivity: diskResult.activities)
+
+            DispatchQueue.main.async {
+                self.liveDiskActivity = diskResult.activities
+                self.liveVolumeState = volumeResult.states
+                self.liveDeviceActivity = deviceActivity
+                self.previousBlockStorageSamples = diskResult.samples
+                self.previousVolumeCapacitySamples = volumeResult.samples
+                self.lastActiveDiskTimestamps = diskResult.lastActive
+                self.isSamplingLiveStorage = false
+            }
+        }
+    }
+
+    private func collectLiveDiskActivity(
+        for devices: [USBDevice],
+        at now: Date,
+        previousSamples: [String: BlockStorageSample],
+        previousLastActive: [String: Date]
+    ) -> (activities: [String: LiveWholeDiskActivity], samples: [String: BlockStorageSample], lastActive: [String: Date]) {
+        let wholeDiskNames = Set(devices.flatMap { $0.sortedStorageVolumes.map(\.wholeDiskBSDName) }.filter { !$0.isEmpty })
+        var activities: [String: LiveWholeDiskActivity] = [:]
+        var nextSamples: [String: BlockStorageSample] = [:]
+        var nextLastActive: [String: Date] = [:]
+
+        for wholeDiskBSDName in wholeDiskNames.sorted() {
+            guard let counters = blockStorageCounters(forWholeDiskBSDName: wholeDiskBSDName) else { continue }
+
+            let currentSample = BlockStorageSample(sampleDate: now, counters: counters)
+            nextSamples[wholeDiskBSDName] = currentSample
+
+            let previousSample = previousSamples[wholeDiskBSDName]
+            let sampleDuration = max(previousSample.map { now.timeIntervalSince($0.sampleDate) } ?? 0, 0.001)
+
+            let readBytesDelta = max(counters.bytesRead - (previousSample?.counters.bytesRead ?? counters.bytesRead), 0)
+            let writeBytesDelta = max(counters.bytesWritten - (previousSample?.counters.bytesWritten ?? counters.bytesWritten), 0)
+            let readOperationsDelta = max(counters.readOperations - (previousSample?.counters.readOperations ?? counters.readOperations), 0)
+            let writeOperationsDelta = max(counters.writeOperations - (previousSample?.counters.writeOperations ?? counters.writeOperations), 0)
+            let readErrorsDelta = max(counters.readErrors - (previousSample?.counters.readErrors ?? counters.readErrors), 0)
+            let writeErrorsDelta = max(counters.writeErrors - (previousSample?.counters.writeErrors ?? counters.writeErrors), 0)
+            let readRetriesDelta = max(counters.readRetries - (previousSample?.counters.readRetries ?? counters.readRetries), 0)
+            let writeRetriesDelta = max(counters.writeRetries - (previousSample?.counters.writeRetries ?? counters.writeRetries), 0)
+            let readTimeDelta = max(counters.totalReadTimeNanoseconds - (previousSample?.counters.totalReadTimeNanoseconds ?? counters.totalReadTimeNanoseconds), 0)
+            let writeTimeDelta = max(counters.totalWriteTimeNanoseconds - (previousSample?.counters.totalWriteTimeNanoseconds ?? counters.totalWriteTimeNanoseconds), 0)
+
+            let readBytesPerSecond = Double(readBytesDelta) / sampleDuration
+            let writeBytesPerSecond = Double(writeBytesDelta) / sampleDuration
+            let readOperationsPerSecond = Double(readOperationsDelta) / sampleDuration
+            let writeOperationsPerSecond = Double(writeOperationsDelta) / sampleDuration
+            let direction = resolveStorageTrafficDirection(
+                readBytesPerSecond: readBytesPerSecond,
+                writeBytesPerSecond: writeBytesPerSecond,
+                readOperationsPerSecond: readOperationsPerSecond,
+                writeOperationsPerSecond: writeOperationsPerSecond
+            )
+
+            let lastActiveAt: Date?
+            if direction == .idle {
+                lastActiveAt = previousLastActive[wholeDiskBSDName]
+            } else {
+                lastActiveAt = now
+                nextLastActive[wholeDiskBSDName] = now
+            }
+
+            let averageReadLatencyMilliseconds = readOperationsDelta > 0
+                ? Double(readTimeDelta) / Double(readOperationsDelta) / 1_000_000.0
+                : nil
+            let averageWriteLatencyMilliseconds = writeOperationsDelta > 0
+                ? Double(writeTimeDelta) / Double(writeOperationsDelta) / 1_000_000.0
+                : nil
+
+            activities[wholeDiskBSDName] = LiveWholeDiskActivity(
+                wholeDiskBSDName: wholeDiskBSDName,
+                sampleDate: now,
+                direction: direction,
+                readBytesPerSecond: readBytesPerSecond,
+                writeBytesPerSecond: writeBytesPerSecond,
+                readOperationsPerSecond: readOperationsPerSecond,
+                writeOperationsPerSecond: writeOperationsPerSecond,
+                totalBytesRead: counters.bytesRead,
+                totalBytesWritten: counters.bytesWritten,
+                totalReadErrors: counters.readErrors,
+                totalWriteErrors: counters.writeErrors,
+                totalReadRetries: counters.readRetries,
+                totalWriteRetries: counters.writeRetries,
+                readErrorDelta: readErrorsDelta,
+                writeErrorDelta: writeErrorsDelta,
+                readRetryDelta: readRetriesDelta,
+                writeRetryDelta: writeRetriesDelta,
+                averageReadLatencyMilliseconds: averageReadLatencyMilliseconds,
+                averageWriteLatencyMilliseconds: averageWriteLatencyMilliseconds,
+                lastActiveAt: lastActiveAt
+            )
+        }
+
+        return (activities, nextSamples, nextLastActive)
+    }
+
+    private func collectMountedVolumeStates(
+        for devices: [USBDevice],
+        at now: Date,
+        previousSamples: [String: VolumeCapacitySample]
+    ) -> (states: [String: LiveMountedVolumeState], samples: [String: VolumeCapacitySample]) {
+        let mountedVolumes = devices.flatMap { $0.sortedStorageVolumes }.filter(\.isMounted)
+        var states: [String: LiveMountedVolumeState] = [:]
+        var nextSamples: [String: VolumeCapacitySample] = [:]
+
+        for volume in mountedVolumes {
+            guard let state = liveMountedVolumeState(for: volume, at: now, previousSample: previousSamples[volume.bsdName]) else { continue }
+            states[volume.bsdName] = state
+            nextSamples[volume.bsdName] = VolumeCapacitySample(
+                sampleDate: now,
+                availableBytes: state.availableBytes,
+                capacityBytes: state.capacityBytes
+            )
+        }
+
+        return (states, nextSamples)
+    }
+
+    private func aggregateDeviceActivity(
+        for devices: [USBDevice],
+        diskActivity: [String: LiveWholeDiskActivity]
+    ) -> [String: DeviceStorageActivity] {
+        var result: [String: DeviceStorageActivity] = [:]
+
+        for device in devices {
+            let diskNames = Array(Set(device.sortedStorageVolumes.map(\.wholeDiskBSDName))).sorted()
+            let matchingDisks = diskNames.compactMap { diskActivity[$0] }
+            guard !matchingDisks.isEmpty else { continue }
+
+            let totalReadBytesPerSecond = matchingDisks.reduce(0) { $0 + $1.readBytesPerSecond }
+            let totalWriteBytesPerSecond = matchingDisks.reduce(0) { $0 + $1.writeBytesPerSecond }
+            let totalReadOperationsPerSecond = matchingDisks.reduce(0) { $0 + $1.readOperationsPerSecond }
+            let totalWriteOperationsPerSecond = matchingDisks.reduce(0) { $0 + $1.writeOperationsPerSecond }
+            let direction = resolveStorageTrafficDirection(
+                readBytesPerSecond: totalReadBytesPerSecond,
+                writeBytesPerSecond: totalWriteBytesPerSecond,
+                readOperationsPerSecond: totalReadOperationsPerSecond,
+                writeOperationsPerSecond: totalWriteOperationsPerSecond
+            )
+            let busiestDiskBSDName = matchingDisks.max {
+                max($0.readBytesPerSecond, $0.writeBytesPerSecond) < max($1.readBytesPerSecond, $1.writeBytesPerSecond)
+            }?.wholeDiskBSDName
+
+            result[device.id] = DeviceStorageActivity(
+                deviceID: device.id,
+                sampleDate: matchingDisks.map(\.sampleDate).max() ?? Date(),
+                direction: direction,
+                readBytesPerSecond: totalReadBytesPerSecond,
+                writeBytesPerSecond: totalWriteBytesPerSecond,
+                readOperationsPerSecond: totalReadOperationsPerSecond,
+                writeOperationsPerSecond: totalWriteOperationsPerSecond,
+                activeDiskCount: matchingDisks.filter(\.isBusy).count,
+                wholeDiskBSDNames: diskNames,
+                busiestDiskBSDName: busiestDiskBSDName,
+                lastActiveAt: matchingDisks.compactMap(\.lastActiveAt).max()
+            )
+        }
+
+        return result
+    }
+
+    private func liveMountedVolumeState(
+        for volume: StorageVolumeInfo,
+        at now: Date,
+        previousSample: VolumeCapacitySample?
+    ) -> LiveMountedVolumeState? {
+        guard volume.isMounted else { return nil }
+
+        let volumeURL = URL(fileURLWithPath: volume.mountPath, isDirectory: true)
+        let resourceKeys: Set<URLResourceKey> = [
+            .volumeAvailableCapacityKey,
+            .volumeTotalCapacityKey,
+            .volumeIsReadOnlyKey,
+            .volumeLocalizedFormatDescriptionKey
+        ]
+
+        let resourceValues = try? volumeURL.resourceValues(forKeys: resourceKeys)
+        let capacityBytes = Int64(resourceValues?.volumeTotalCapacity ?? Int(volume.capacityBytes))
+        let availableBytes = Int64(resourceValues?.volumeAvailableCapacity ?? Int(volume.availableBytes))
+        let isReadOnly = resourceValues?.volumeIsReadOnly ?? false
+        let formatDescription = resourceValues?.volumeLocalizedFormatDescription ?? volume.fileSystem
+        let sampleDuration = max(previousSample.map { now.timeIntervalSince($0.sampleDate) } ?? 0, 0.001)
+        let availableBytesPerSecond = previousSample.map {
+            Double(availableBytes - $0.availableBytes) / sampleDuration
+        } ?? 0
+
+        return LiveMountedVolumeState(
+            bsdName: volume.bsdName,
+            sampleDate: now,
+            capacityBytes: capacityBytes,
+            availableBytes: availableBytes,
+            availableBytesPerSecond: availableBytesPerSecond,
+            isReadOnly: isReadOnly,
+            formatDescription: formatDescription
+        )
+    }
+
+    private func blockStorageCounters(forWholeDiskBSDName wholeDiskBSDName: String) -> BlockStorageCounters? {
+        guard let matching = IOBSDNameMatching(kIOMainPortDefault, 0, wholeDiskBSDName) else { return nil }
+
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else { return nil }
+        defer { IOObjectRelease(iterator) }
+
+        let media = IOIteratorNext(iterator)
+        guard media != 0 else { return nil }
+        defer { IOObjectRelease(media) }
+
+        var current = media
+        var shouldReleaseCurrent = false
+
+        while true {
+            if let properties = registryProperties(for: current),
+               let counters = parseBlockStorageCounters(from: properties) {
+                if shouldReleaseCurrent {
+                    IOObjectRelease(current)
+                }
+                return counters
+            }
+
+            var parent: io_registry_entry_t = 0
+            guard IORegistryEntryGetParentEntry(current, kIOServicePlane, &parent) == KERN_SUCCESS else {
+                if shouldReleaseCurrent {
+                    IOObjectRelease(current)
+                }
+                return nil
+            }
+
+            if shouldReleaseCurrent {
+                IOObjectRelease(current)
+            }
+
+            current = parent
+            shouldReleaseCurrent = true
+        }
+    }
+
+    private func parseBlockStorageCounters(from properties: [String: Any]) -> BlockStorageCounters? {
+        guard let stats = properties[kIOBlockStorageStatisticsKey] as? [String: Any] else { return nil }
+
+        return BlockStorageCounters(
+            bytesRead: int64Value(stats[kIOBlockStorageBytesReadKey]) ?? 0,
+            bytesWritten: int64Value(stats[kIOBlockStorageBytesWrittenKey]) ?? 0,
+            readErrors: int64Value(stats[kIOBlockStorageReadErrorsKey]) ?? 0,
+            writeErrors: int64Value(stats[kIOBlockStorageWriteErrorsKey]) ?? 0,
+            readRetries: int64Value(stats[kIOBlockStorageReadRetriesKey]) ?? 0,
+            writeRetries: int64Value(stats[kIOBlockStorageWriteRetriesKey]) ?? 0,
+            readOperations: int64Value(stats[kIOBlockStorageReadOperationsKey]) ?? 0,
+            writeOperations: int64Value(stats[kIOBlockStorageWriteOperationsKey]) ?? 0,
+            totalReadTimeNanoseconds: int64Value(stats[kIOBlockStorageTotalReadTimeKey]) ?? 0,
+            totalWriteTimeNanoseconds: int64Value(stats[kIOBlockStorageTotalWriteTimeKey]) ?? 0
+        )
     }
 
     // MARK: - Scan USB Controllers
@@ -2737,6 +3554,18 @@ struct ContentView: View {
         return usbManager.thunderboltDevices.first { $0.id == selectedThunderboltID }
     }
 
+    func attachedDevices(for controller: USBController) -> [USBDevice] {
+        usbManager.devices.filter { $0.controllerGroupName == controller.name }
+    }
+
+    func activeStorageDeviceCount(for controller: USBController) -> Int {
+        attachedDevices(for: controller).filter { usbManager.liveDeviceActivity[$0.id]?.isBusy == true }.count
+    }
+
+    func performanceLimitedDeviceCount(for controller: USBController) -> Int {
+        attachedDevices(for: controller).filter(\.isPerformanceLimited).count
+    }
+
     var body: some View {
         NavigationSplitView {
             VStack(spacing: 0) {
@@ -2756,6 +3585,7 @@ struct ContentView: View {
                     StatBadge(label: "USB", count: usbManager.devices.count, color: .blue)
                     StatBadge(label: "Controllers", count: usbManager.controllers.count, color: .green)
                     StatBadge(label: "TB", count: usbManager.thunderboltDevices.count, color: .purple)
+                    StatBadge(label: "Active", count: usbManager.liveDeviceActivity.values.filter { $0.isBusy }.count, color: .orange)
                 }
                 .padding(.horizontal)
                 .padding(.vertical, 8)
@@ -2832,7 +3662,7 @@ struct ContentView: View {
                     ForEach(deviceHierarchySections) { section in
                         Section {
                             OutlineGroup(section.roots, children: \.children) { node in
-                                DeviceRow(device: node.device)
+                                DeviceRow(device: node.device, activity: usbManager.liveDeviceActivity[node.device.id])
                                     .tag(node.device.id)
                             }
                         } header: {
@@ -2847,16 +3677,51 @@ struct ContentView: View {
 
     // MARK: - Controller List
     var controllerListView: some View {
-        List(usbManager.controllers, selection: $selectedControllerID) { controller in
-            ControllerRow(controller: controller)
+        VStack(spacing: 12) {
+            UsageGuideCard(
+                icon: "cpu",
+                title: "How to use Controllers",
+                summary: "This tab is about path ownership. Open it when you need to know which chip owns a slow device, which hubs share the same bandwidth, or which branch a problem device lives under.",
+                accent: .blue,
+                tips: [
+                    "If a drive is slower than expected, check whether it landed on an older controller.",
+                    "Use Port Map to see what is hanging off the same controller before blaming the device itself.",
+                    "Use Devices On This Controller when you want the full shared-bandwidth picture."
+                ]
+            )
+            .padding(.horizontal)
+            .padding(.top, 12)
+
+            List(usbManager.controllers, selection: $selectedControllerID) { controller in
+                ControllerRow(
+                    controller: controller,
+                    attachedDeviceCount: attachedDevices(for: controller).count,
+                    activeDeviceCount: activeStorageDeviceCount(for: controller),
+                    slowDeviceCount: performanceLimitedDeviceCount(for: controller)
+                )
                 .tag(controller.id)
+            }
+            .listStyle(.inset)
         }
-        .listStyle(.inset)
     }
 
     // MARK: - Thunderbolt List
     var thunderboltListView: some View {
-        Group {
+        VStack(spacing: 12) {
+            UsageGuideCard(
+                icon: "bolt.horizontal.fill",
+                title: "How to use Thunderbolt",
+                summary: "This tab is for docks, displays, USB4/Thunderbolt paths, and route diagnosis. Some entries are just ports or routing nodes, so not everything here is a user-facing gadget.",
+                accent: .purple,
+                tips: [
+                    "If a dock, display, or premium SSD feels wrong, check the current link speed here first.",
+                    "Port and switch entries are infrastructure. They help you trace the route, not open files in Finder.",
+                    "If the names look kernel-ish, click in anyway: the detail page now translates what the entry actually is."
+                ]
+            )
+            .padding(.horizontal)
+            .padding(.top, 12)
+
             if usbManager.thunderboltDevices.isEmpty {
                 ContentUnavailableView {
                     Label("No Thunderbolt Devices", systemImage: "bolt.horizontal.circle")
@@ -2905,6 +3770,16 @@ struct ContentView: View {
                 Text("Updated: \(usbManager.lastUpdated.formatted(date: .omitted, time: .standard))")
                     .font(.caption)
                     .foregroundColor(.secondary)
+
+                let activeCount = usbManager.liveDeviceActivity.values.filter { $0.isBusy }.count
+                if activeCount > 0 {
+                    Text("•")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Text(activeCount == 1 ? "1 storage device active" : "\(activeCount) storage devices active")
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                }
             }
             Spacer()
         }
@@ -2918,7 +3793,16 @@ struct ContentView: View {
         switch viewMode {
         case .devices:
             if let device = selectedDevice {
-                DeviceDetailView(device: device, allDevices: usbManager.devices, showRaw: showRawProperties, onRefresh: usbManager.refreshAll)
+                DeviceDetailView(
+                    device: device,
+                    allDevices: usbManager.devices,
+                    deviceActivity: usbManager.liveDeviceActivity[device.id],
+                    allDeviceActivityLookup: usbManager.liveDeviceActivity,
+                    diskActivityLookup: usbManager.liveDiskActivity,
+                    volumeStateLookup: usbManager.liveVolumeState,
+                    showRaw: showRawProperties,
+                    onRefresh: usbManager.refreshAll
+                )
             } else {
                 ContentUnavailableView {
                     Label("Select a Device", systemImage: "cable.connector")
@@ -2928,12 +3812,18 @@ struct ContentView: View {
             }
         case .controllers:
             if let controller = selectedController {
-                ControllerDetailView(controller: controller, devices: usbManager.devices, showRaw: showRawProperties)
+                ControllerDetailView(
+                    controller: controller,
+                    devices: usbManager.devices,
+                    deviceActivityLookup: usbManager.liveDeviceActivity,
+                    volumeStateLookup: usbManager.liveVolumeState,
+                    showRaw: showRawProperties
+                )
             } else {
                 ContentUnavailableView {
                     Label("Select a Controller", systemImage: "cpu")
                 } description: {
-                    Text("USB Controllers are the chips that manage your USB ports. Select one to see what speeds it supports.")
+                    Text("Use Controllers to answer which chip owns a path, which devices are sharing bandwidth, and whether a slow device is stuck behind an older controller or hub chain.")
                 }
             }
         case .thunderbolt:
@@ -2943,7 +3833,7 @@ struct ContentView: View {
                 ContentUnavailableView {
                     Label("Select a Thunderbolt Device", systemImage: "bolt.horizontal")
                 } description: {
-                    Text("Thunderbolt is faster than USB. Select a device to see its capabilities.")
+                    Text("Use Thunderbolt to trace docks, displays, and high-speed SSD paths. Port and switch entries are routing infrastructure, while some entries represent actual connected devices.")
                 }
             }
         case .rawData:
@@ -2972,9 +3862,50 @@ struct StatBadge: View {
     }
 }
 
+struct UsageGuideCard: View {
+    let icon: String
+    let title: String
+    let summary: String
+    let accent: Color
+    let tips: [String]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: icon)
+                    .foregroundColor(accent)
+                Text(title)
+                    .font(.headline)
+            }
+
+            Text(summary)
+                .font(.callout)
+                .foregroundColor(.secondary)
+
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(tips, id: \.self) { tip in
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "arrow.right.circle.fill")
+                            .font(.caption)
+                            .foregroundColor(accent)
+                            .padding(.top, 3)
+                        Text(tip)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .background(accent.opacity(0.1))
+        .cornerRadius(12)
+    }
+}
+
 // MARK: - Device Row
 struct DeviceRow: View {
     let device: USBDevice
+    let activity: DeviceStorageActivity?
 
     var body: some View {
         HStack(spacing: 12) {
@@ -2999,6 +3930,14 @@ struct DeviceRow: View {
                     .font(.caption2)
                     .foregroundColor(.secondary)
                     .lineLimit(1)
+
+                if let activity, let badgeText = activity.compactBadgeText {
+                    Text(badgeText)
+                        .font(.caption2)
+                        .fontWeight(.medium)
+                        .foregroundColor(activity.direction.color)
+                        .lineLimit(1)
+                }
 
                 HStack(spacing: 6) {
                     Text(device.negotiatedSpeedDescription)
@@ -3071,8 +4010,12 @@ struct DeviceHierarchySectionHeader: View {
 struct USBHierarchyBranchView: View {
     let node: USBHierarchyNode
     var showVolumes: Bool = true
+    var deviceActivityLookup: [String: DeviceStorageActivity] = [:]
+    var volumeStateLookup: [String: LiveMountedVolumeState] = [:]
 
     var body: some View {
+        let deviceActivity = deviceActivityLookup[node.device.id]
+
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top, spacing: 10) {
                 Image(systemName: node.device.classInfo.icon)
@@ -3093,6 +4036,13 @@ struct USBHierarchyBranchView: View {
                     Text(node.device.hierarchyIdentityLine)
                         .font(.caption2)
                         .foregroundColor(.secondary)
+
+                    if let deviceActivity, let badgeText = deviceActivity.compactBadgeText {
+                        Text(badgeText)
+                            .font(.caption2)
+                            .fontWeight(.medium)
+                            .foregroundColor(deviceActivity.direction.color)
+                    }
 
                     if let children = node.children, !children.isEmpty {
                         Text(children.count == 1 ? "1 downstream child" : "\(children.count) downstream children")
@@ -3115,17 +4065,40 @@ struct USBHierarchyBranchView: View {
             if showVolumes && !node.device.mountedVolumes.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     ForEach(node.device.mountedVolumes) { volume in
-                        HStack(spacing: 8) {
-                            Image(systemName: "internaldrive")
-                                .font(.caption)
-                                .foregroundColor(.green)
-                                .frame(width: 14)
-                            Text(volume.displayName)
-                                .font(.caption)
-                            Spacer()
-                            Text(volume.bsdName)
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 8) {
+                                Image(systemName: "internaldrive")
+                                    .font(.caption)
+                                    .foregroundColor(.green)
+                                    .frame(width: 14)
+
+                                Text(volume.displayName)
+                                    .font(.caption)
+
+                                Spacer()
+
+                                Text(volume.bsdName)
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+
+                            if let liveVolume = volumeStateLookup[volume.bsdName] {
+                                HStack(spacing: 8) {
+                                    Text(liveVolume.freeDescription)
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+
+                                    if let freeChangeDescription = liveVolume.freeChangeDescription {
+                                        Text("•")
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                        Text(freeChangeDescription)
+                                            .font(.caption2)
+                                            .foregroundColor(freeChangeDescription.contains("dropping") ? .orange : .green)
+                                    }
+                                }
+                                .padding(.leading, 22)
+                            }
                         }
                     }
                 }
@@ -3135,7 +4108,12 @@ struct USBHierarchyBranchView: View {
             if let children = node.children, !children.isEmpty {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(children) { child in
-                        USBHierarchyBranchView(node: child, showVolumes: showVolumes)
+                        USBHierarchyBranchView(
+                            node: child,
+                            showVolumes: showVolumes,
+                            deviceActivityLookup: deviceActivityLookup,
+                            volumeStateLookup: volumeStateLookup
+                        )
                     }
                 }
                 .padding(.leading, 18)
@@ -3152,9 +4130,123 @@ struct USBHierarchyBranchView: View {
     }
 }
 
+struct USBPortOccupancy: Identifiable, Hashable {
+    let portNumber: Int
+    let occupant: USBDevice?
+    let descendantCount: Int
+
+    var id: Int { portNumber }
+}
+
+struct USBPortMapView: View {
+    let basePath: [Int]
+    let observedDevices: [USBDevice]
+    let knownPortCount: Int?
+    var deviceActivityLookup: [String: DeviceStorageActivity] = [:]
+
+    private var occupancies: [USBPortOccupancy] {
+        let grouped = Dictionary(grouping: observedDevices.filter { candidate in
+            candidate.portPathComponents.count > basePath.count &&
+            usbPathIsPrefix(basePath, of: candidate.portPathComponents)
+        }) { candidate in
+            candidate.portPathComponents[basePath.count]
+        }
+
+        let visiblePorts: [Int]
+        if let knownPortCount, knownPortCount > 0 {
+            visiblePorts = Array(1...max(knownPortCount, grouped.keys.max() ?? 0))
+        } else {
+            visiblePorts = grouped.keys.sorted()
+        }
+
+        return visiblePorts.map { portNumber in
+            let portDevices = (grouped[portNumber] ?? []).sorted { lhs, rhs in
+                if lhs.portPathComponents.count != rhs.portPathComponents.count {
+                    return lhs.portPathComponents.count < rhs.portPathComponents.count
+                }
+                return usbHierarchySort(lhs, rhs)
+            }
+
+            return USBPortOccupancy(
+                portNumber: portNumber,
+                occupant: portDevices.first,
+                descendantCount: max(portDevices.count - 1, 0)
+            )
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Observed port occupancy")
+                .font(.caption)
+                .fontWeight(.semibold)
+                .foregroundColor(.secondary)
+
+            if occupancies.isEmpty {
+                Text("No downstream devices are currently visible on this branch.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else {
+                ForEach(occupancies) { occupancy in
+                    HStack(alignment: .top, spacing: 12) {
+                        Text("Port \(occupancy.portNumber)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .frame(width: 52, alignment: .leading)
+
+                        if let occupant = occupancy.occupant {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(occupant.name)
+                                    .font(.subheadline)
+                                    .fontWeight(.medium)
+
+                                Text(occupant.hierarchyIdentityLine)
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+
+                                if let activity = deviceActivityLookup[occupant.id], let badgeText = activity.compactBadgeText {
+                                    Text(badgeText)
+                                        .font(.caption2)
+                                        .fontWeight(.medium)
+                                        .foregroundColor(activity.direction.color)
+                                }
+
+                                if occupancy.descendantCount > 0 {
+                                    Text(occupancy.descendantCount == 1 ? "1 downstream device continues through this branch" : "\(occupancy.descendantCount) downstream devices continue through this branch")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+
+                            Spacer()
+
+                            Text(occupant.negotiatedSpeedDescription)
+                                .font(.caption2)
+                                .fontWeight(.medium)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 3)
+                                .background(occupant.speed.color.opacity(0.18))
+                                .cornerRadius(5)
+                        } else {
+                            Text("Empty / no device observed")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Spacer()
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Controller Row
 struct ControllerRow: View {
     let controller: USBController
+    let attachedDeviceCount: Int
+    let activeDeviceCount: Int
+    let slowDeviceCount: Int
 
     var body: some View {
         HStack(spacing: 12) {
@@ -3164,9 +4256,16 @@ struct ControllerRow: View {
                 .frame(width: 30)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(controller.name)
+                Text(controller.displayName)
                     .font(.headline)
                     .lineLimit(1)
+
+                if let technicalName = controller.technicalNameDescription {
+                    Text(technicalName)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
 
                 HStack(spacing: 6) {
                     Text(controller.controllerType)
@@ -3180,6 +4279,22 @@ struct ControllerRow: View {
                         Text("Built-in")
                             .font(.caption2)
                             .foregroundColor(.secondary)
+                    }
+
+                    Text(attachedDeviceCount == 1 ? "1 device" : "\(attachedDeviceCount) devices")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+
+                    if activeDeviceCount > 0 {
+                        Text(activeDeviceCount == 1 ? "1 active" : "\(activeDeviceCount) active")
+                            .font(.caption2)
+                            .foregroundColor(.orange)
+                    }
+
+                    if slowDeviceCount > 0 {
+                        Text(slowDeviceCount == 1 ? "1 limited" : "\(slowDeviceCount) limited")
+                            .font(.caption2)
+                            .foregroundColor(.orange)
                     }
                 }
             }
@@ -3200,9 +4315,16 @@ struct ThunderboltRow: View {
                 .frame(width: 30)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(device.name)
+                Text(device.displayName)
                     .font(.headline)
                     .lineLimit(1)
+
+                if !device.userFacingSubtitle.isEmpty {
+                    Text(device.userFacingSubtitle)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
 
                 HStack(spacing: 6) {
                     Text(device.generationString)
@@ -3212,12 +4334,10 @@ struct ThunderboltRow: View {
                         .background(device.color.opacity(0.2))
                         .cornerRadius(4)
 
-                    if !device.vendorName.isEmpty {
-                        Text(device.vendorName)
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                            .lineLimit(1)
-                    }
+                    Text(device.roleTitle)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
                 }
             }
         }
@@ -3229,9 +4349,13 @@ struct ThunderboltRow: View {
 struct DeviceDetailView: View {
     let device: USBDevice
     let allDevices: [USBDevice]
+    let deviceActivity: DeviceStorageActivity?
+    let allDeviceActivityLookup: [String: DeviceStorageActivity]
+    let diskActivityLookup: [String: LiveWholeDiskActivity]
+    let volumeStateLookup: [String: LiveMountedVolumeState]
     let showRaw: Bool
     let onRefresh: () -> Void
-    @State private var expandedSections: Set<String> = ["translation", "speed", "device", "volumes", "interfaces", "power", "quality"]
+    @State private var expandedSections: Set<String> = ["translation", "activity", "speed", "device", "volumes", "interfaces", "power", "quality"]
     @State private var volumeActionStatus: String?
 
     private func isPrefixPath(_ prefix: [Int], of candidate: [Int]) -> Bool {
@@ -3278,6 +4402,12 @@ struct DeviceDetailView: View {
                 }
                 return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
             }
+    }
+
+    private var liveWholeDiskActivity: [LiveWholeDiskActivity] {
+        Array(Set(device.sortedStorageVolumes.map(\.wholeDiskBSDName)))
+            .sorted()
+            .compactMap { diskActivityLookup[$0] }
     }
 
     private func revealInFinder(_ volume: StorageVolumeInfo) {
@@ -3340,6 +4470,12 @@ struct DeviceDetailView: View {
 
                 CollapsibleSection(title: "🧠 Translation Layer", icon: "lightbulb", isExpanded: binding(for: "translation")) {
                     translationSection
+                }
+
+                if !device.storageVolumes.isEmpty {
+                    CollapsibleSection(title: "📈 Live Activity", icon: "waveform.path.ecg", isExpanded: binding(for: "activity")) {
+                        liveActivitySection
+                    }
                 }
 
                 // Connection Quality Card
@@ -3439,6 +4575,19 @@ struct DeviceDetailView: View {
                     .font(.subheadline)
                     .fontWeight(.medium)
 
+                if let deviceActivity {
+                    HStack(spacing: 6) {
+                        Image(systemName: deviceActivity.direction.icon)
+                            .font(.caption)
+                            .foregroundColor(deviceActivity.direction.color)
+
+                        Text(deviceActivity.isBusy ? (deviceActivity.compactBadgeText ?? deviceActivity.direction.label) : "Idle right now")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                            .foregroundColor(deviceActivity.direction.color)
+                    }
+                }
+
                 // Layman-friendly explanation
                 Text(device.classInfo.layman)
                     .font(.caption)
@@ -3451,6 +4600,84 @@ struct DeviceDetailView: View {
             }
 
             Spacer()
+        }
+    }
+
+    var liveActivitySection: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if let deviceActivity {
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: deviceActivity.direction.icon)
+                        .foregroundColor(deviceActivity.direction.color)
+                        .font(.title3)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(deviceActivity.direction.label)
+                            .font(.headline)
+                        Text(deviceActivity.summary)
+                            .font(.callout)
+                    }
+                }
+
+                if deviceActivity.direction == .idle, let lastActiveAt = deviceActivity.lastActiveAt {
+                    Text("Last active \(relativeTimestampDescription(lastActiveAt)).")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            } else {
+                Text("Waiting for the first live storage sample from macOS.")
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+            }
+
+            Divider()
+
+            if liveWholeDiskActivity.isEmpty {
+                Text("This device has Finder-visible storage objects, but macOS has not exposed a block-storage counter sample yet.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else {
+                ForEach(liveWholeDiskActivity) { diskActivity in
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text(diskActivity.wholeDiskBSDName)
+                                .font(.subheadline)
+                                .fontWeight(.semibold)
+                            Spacer()
+                            MetadataPill(text: diskActivity.direction.label, accent: diskActivity.direction.color)
+                        }
+
+                        Text(diskActivity.direction.explanation)
+                            .font(.callout)
+
+                        DetailRow(label: "Throughput", value: diskActivity.throughputSummary)
+                        DetailRow(label: "Operations", value: diskActivity.operationSummary)
+
+                        if let latencySummary = diskActivity.latencySummary {
+                            DetailRow(label: "Latency", value: latencySummary)
+                        }
+
+                        if let reliabilitySummary = diskActivity.reliabilitySummary {
+                            Text(reliabilitySummary)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+
+                        if let lastActiveAt = diskActivity.lastActiveAt, !diskActivity.isBusy {
+                            Text("Last active \(relativeTimestampDescription(lastActiveAt)).")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(12)
+                    .background(Color(nsColor: .controlBackgroundColor))
+                    .cornerRadius(10)
+                }
+            }
+
+            Text("Powered by IOBlockStorageDriver statistics plus live mounted-volume capacity sampling.")
+                .font(.caption2)
+                .foregroundColor(.secondary)
         }
     }
 
@@ -3657,6 +4884,38 @@ struct DeviceDetailView: View {
                         }
                     }
 
+                    if let diskActivity = diskActivityLookup[wholeDiskBSDName] {
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                MetadataPill(text: diskActivity.direction.label, accent: diskActivity.direction.color)
+                                Spacer()
+                                Text(diskActivity.throughputSummary)
+                                    .font(.caption)
+                                    .fontWeight(.medium)
+                                    .foregroundColor(diskActivity.direction.color)
+                            }
+
+                            Text(diskActivity.operationSummary)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+
+                            if let latencySummary = diskActivity.latencySummary {
+                                Text(latencySummary)
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+
+                            if let reliabilitySummary = diskActivity.reliabilitySummary {
+                                Text(reliabilitySummary)
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        .padding(10)
+                        .background(diskActivity.direction.color.opacity(0.08))
+                        .cornerRadius(8)
+                    }
+
                     if children.isEmpty {
                         Text("No mounted Finder volumes are currently hanging off this disk object.")
                             .font(.caption)
@@ -3681,6 +4940,40 @@ struct DeviceDetailView: View {
                                     .foregroundColor(.secondary)
 
                                 if volume.isMounted {
+                                    if let liveState = volumeStateLookup[volume.bsdName] {
+                                        Text(liveState.usageDescription)
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+
+                                        if let usageFraction = liveState.usageFraction {
+                                            ProgressView(value: usageFraction)
+                                                .tint(device.speed.color)
+                                        }
+
+                                        HStack(spacing: 8) {
+                                            Text(liveState.freeDescription)
+                                                .font(.caption2)
+                                                .foregroundColor(.secondary)
+
+                                            Text("•")
+                                                .font(.caption2)
+                                                .foregroundColor(.secondary)
+
+                                            Text(liveState.accessibilitySummary)
+                                                .font(.caption2)
+                                                .foregroundColor(liveState.isReadOnly ? .orange : .green)
+
+                                            if let freeChangeDescription = liveState.freeChangeDescription {
+                                                Text("•")
+                                                    .font(.caption2)
+                                                    .foregroundColor(.secondary)
+                                                Text(freeChangeDescription)
+                                                    .font(.caption2)
+                                                    .foregroundColor(freeChangeDescription.contains("dropping") ? .orange : .green)
+                                            }
+                                        }
+                                    }
+
                                     Text(volume.mountDescription)
                                         .font(.caption)
                                         .foregroundColor(.secondary)
@@ -3978,6 +5271,21 @@ struct DeviceDetailView: View {
                 }
             }
 
+            if device.isHub {
+                Divider()
+
+                USBPortMapView(
+                    basePath: device.portPathComponents,
+                    observedDevices: allDevices.filter {
+                        $0.id != device.id &&
+                        $0.controllerGroupName == device.controllerGroupName &&
+                        usbPathIsPrefix(device.portPathComponents, of: $0.portPathComponents)
+                    },
+                    knownPortCount: device.portCount > 0 ? device.portCount : nil,
+                    deviceActivityLookup: allDeviceActivityLookup
+                )
+            }
+
             Divider()
 
             // Technical details (collapsed)
@@ -4125,6 +5433,8 @@ struct SpeedDetailView: View {
 struct ControllerDetailView: View {
     let controller: USBController
     let devices: [USBDevice]
+    let deviceActivityLookup: [String: DeviceStorageActivity]
+    let volumeStateLookup: [String: LiveMountedVolumeState]
     let showRaw: Bool
 
     var attachedDevices: [USBDevice] {
@@ -4135,6 +5445,43 @@ struct ControllerDetailView: View {
 
     var attachedHierarchy: [USBHierarchyNode] {
         buildUSBHierarchyTree(from: attachedDevices)
+    }
+
+    var attachedHubCount: Int {
+        attachedDevices.filter(\.isHub).count
+    }
+
+    var storageDeviceCount: Int {
+        attachedDevices.filter { !$0.storageVolumes.isEmpty }.count
+    }
+
+    var activeStorageCount: Int {
+        attachedDevices.filter { deviceActivityLookup[$0.id]?.isBusy == true }.count
+    }
+
+    var performanceLimitedDeviceCount: Int {
+        attachedDevices.filter(\.isPerformanceLimited).count
+    }
+
+    var controllerChecklist: [String] {
+        [
+            "Start with Port Map if you are asking which branch, hub, or downstream path a problem device sits on.",
+            "Use Devices On This Controller to see what is sharing bandwidth and bus power with the device you care about.",
+            controller.supportsUSB3 ? "If something is still slow here, the bottleneck is more likely the cable, hub, enclosure, or negotiated link." : "If a fast modern drive is attached here, this controller alone can explain a USB 2-style ceiling."
+        ]
+    }
+
+    var practicalTakeaway: String {
+        if attachedDevices.isEmpty {
+            return "Nothing is attached here right now, so this controller is not part of your current external-device story."
+        }
+        if !controller.supportsUSB3 {
+            return "This is the first place to look when a supposedly fast device feels capped at old-school USB 2 performance."
+        }
+        if performanceLimitedDeviceCount > 0 {
+            return "At least one attached device is negotiating below what its descriptors suggest, so use the port map and branch tree to inspect the shared path."
+        }
+        return "This controller looks healthy. Use it mainly to understand shared paths, hubs, and branch ownership rather than to hunt for an obvious controller-side bottleneck."
     }
 
     var body: some View {
@@ -4152,15 +5499,21 @@ struct ControllerDetailView: View {
                     }
 
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(controller.name)
+                        Text(controller.displayName)
                             .font(.title2)
                             .fontWeight(.bold)
                         Text(controller.controllerType)
                             .font(.subheadline)
                             .foregroundColor(.secondary)
 
+                        if let technicalName = controller.technicalNameDescription {
+                            Text(technicalName)
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+
                         // Layman explanation
-                        Text(controller.supportsUSB3 ? "This controller supports fast USB 3.0+ speeds" : "Older controller – supports USB 2.0 speeds only")
+                        Text(controller.usageSummary)
                             .font(.caption)
                             .foregroundColor(.secondary)
                             .italic()
@@ -4173,15 +5526,22 @@ struct ControllerDetailView: View {
 
                 // What does this mean?
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("💡 What is a USB Controller?")
-                        .font(.headline)
-                    Text("A USB controller is a chip inside your Mac that manages USB ports. Each controller can handle multiple ports, and the type of controller determines the maximum speed your devices can achieve.")
-                        .font(.callout)
-                        .foregroundColor(.secondary)
+                    UsageGuideCard(
+                        icon: "cpu",
+                        title: "How to use this page",
+                        summary: practicalTakeaway,
+                        accent: .blue,
+                        tips: controllerChecklist
+                    )
                 }
-                .padding()
-                .background(Color.blue.opacity(0.1))
-                .cornerRadius(10)
+
+                DetailSection(title: "🧠 Quick Answers") {
+                    DetailRow(label: "Attached devices", value: "\(attachedDevices.count)")
+                    DetailRow(label: "Hubs on this controller", value: "\(attachedHubCount)")
+                    DetailRow(label: "Storage devices here", value: "\(storageDeviceCount)")
+                    DetailRow(label: "Storage devices active now", value: "\(activeStorageCount)")
+                    DetailRow(label: "Devices below expected link", value: "\(performanceLimitedDeviceCount)")
+                }
 
                 DetailSection(title: "📋 Controller Details") {
                     DetailRow(label: "Type", value: controller.controllerType)
@@ -4198,6 +5558,17 @@ struct ControllerDetailView: View {
                 }
 
                 if !attachedDevices.isEmpty {
+                    DetailSection(title: "🧭 Port Map") {
+                        USBPortMapView(
+                            basePath: [],
+                            observedDevices: attachedDevices,
+                            knownPortCount: nil,
+                            deviceActivityLookup: deviceActivityLookup
+                        )
+                    }
+                }
+
+                if !attachedDevices.isEmpty {
                     DetailSection(title: "🔗 Devices On This Controller") {
                         VStack(alignment: .leading, spacing: 10) {
                             Text("Nested by hub and port path so same-named devices are easier to distinguish.")
@@ -4205,7 +5576,11 @@ struct ControllerDetailView: View {
                                 .foregroundColor(.secondary)
 
                             ForEach(attachedHierarchy) { node in
-                                USBHierarchyBranchView(node: node)
+                                USBHierarchyBranchView(
+                                    node: node,
+                                    deviceActivityLookup: deviceActivityLookup,
+                                    volumeStateLookup: volumeStateLookup
+                                )
                             }
                         }
                     }
@@ -4259,6 +5634,13 @@ struct ThunderboltDetailView: View {
         }
     }
 
+    var practicalTakeaway: String {
+        if let whenToIgnoreSummary = device.whenToIgnoreSummary {
+            return whenToIgnoreSummary
+        }
+        return device.howToUseSummary
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
@@ -4274,12 +5656,19 @@ struct ThunderboltDetailView: View {
                     }
 
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(device.name)
+                        Text(device.displayName)
                             .font(.title2)
                             .fontWeight(.bold)
-                        Text(device.generationString)
+                        Text(device.userFacingSubtitle)
                             .font(.subheadline)
                             .foregroundColor(.secondary)
+
+                        if device.displayName != device.name {
+                            Text(device.name)
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+
                         Text(speedExplanation)
                             .font(.caption)
                             .foregroundColor(.secondary)
@@ -4298,19 +5687,24 @@ struct ThunderboltDetailView: View {
 
                 Divider()
 
-                // What is Thunderbolt?
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("⚡ What is Thunderbolt?")
-                        .font(.headline)
-                    Text("Thunderbolt is a high-speed connection technology developed by Intel and Apple. It's much faster than USB and can carry data, video, and power all through one cable. Thunderbolt 3 and 4 use the same connector as USB-C.")
-                        .font(.callout)
-                        .foregroundColor(.secondary)
+                UsageGuideCard(
+                    icon: "bolt.horizontal.fill",
+                    title: "How to use this page",
+                    summary: device.howToUseSummary,
+                    accent: device.color,
+                    tips: device.checklist
+                )
+
+                DetailSection(title: "🧠 What this entry actually is") {
+                    DetailRow(label: "Role", value: device.roleTitle)
+                    DetailRow(label: "Why it matters", value: practicalTakeaway)
+                    if !device.routeString.isEmpty {
+                        DetailRow(label: "Route", value: device.routeString)
+                    }
                 }
-                .padding()
-                .background(Color.purple.opacity(0.1))
-                .cornerRadius(10)
 
                 DetailSection(title: "📦 Device Info") {
+                    DetailRow(label: "Display name", value: device.displayName)
                     if !device.vendorName.isEmpty {
                         DetailRow(label: "Made by", value: device.vendorName)
                     }
@@ -4320,7 +5714,7 @@ struct ThunderboltDetailView: View {
                     DetailRow(label: "Status", value: device.isConnected ? "✅ Connected and working" : "⚠️ Disconnected")
                 }
 
-                DetailSection(title: "⚡ Speed & Performance") {
+                DetailSection(title: "⚡ Bandwidth Clues") {
                     DetailRow(label: "Generation", value: device.generationString)
                     DetailRow(label: "Maximum Speed", value: device.speedDescription)
                     if device.linkSpeed > 0 {
@@ -4420,7 +5814,11 @@ struct RawDataOverview: View {
                 .foregroundColor(.secondary)
 
             ForEach(section.roots) { node in
-                USBHierarchyBranchView(node: node)
+                USBHierarchyBranchView(
+                    node: node,
+                    deviceActivityLookup: manager.liveDeviceActivity,
+                    volumeStateLookup: manager.liveVolumeState
+                )
             }
         }
         .padding()
@@ -4446,6 +5844,8 @@ struct RawDataOverview: View {
                     DetailRow(label: "Composite Devices", value: "\(manager.devices.filter { $0.isCompositeDevice }.count)")
                     DetailRow(label: "USB 3+ Running Slow", value: "\(manager.devices.filter { $0.isPerformanceLimited }.count)")
                     DetailRow(label: "Mapped Finder Volumes", value: "\(manager.devices.flatMap(\.mountedVolumes).count)")
+                    DetailRow(label: "Storage Devices Busy Now", value: "\(manager.liveDeviceActivity.values.filter { $0.isBusy }.count)")
+                    DetailRow(label: "Volumes With Free-Space Movement", value: "\(manager.liveVolumeState.values.filter { $0.freeChangeDescription != nil }.count)")
                 }
 
                 DetailSection(title: "Speed Distribution") {
