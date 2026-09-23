@@ -15,6 +15,6 @@ macOS 26.0 or later. The project also targets iPhone and iPad, where the app sho
 
 ## Status
 
-Prototype, not maintained. Last commit: May 13, 2026.
+Prototype, not maintained. Last code change: May 13, 2026.
 
 No license file is included.
